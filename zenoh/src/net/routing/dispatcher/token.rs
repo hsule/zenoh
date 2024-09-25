@@ -77,6 +77,17 @@ pub(crate) fn declare_token(
                     (res, wtables)
                 };
 
+            dbg!();
+            eprintln!(
+                "{} -> {}: DeclareToken(id={}, expr={}, interest_id={:?})",
+                face.zid,
+                wtables.zid,
+                id,
+                res.expr(),
+                interest_id
+            );
+            eprintln!();
+
             hat_code.declare_token(
                 &mut wtables,
                 face,

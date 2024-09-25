@@ -166,6 +166,10 @@ impl Tables {
             }
         }
     }
+
+    pub(crate) fn faces(&self) -> Vec<Arc<FaceState>> {
+        self.faces.values().cloned().collect::<Vec<_>>()
+    }
 }
 
 pub struct TablesLock {

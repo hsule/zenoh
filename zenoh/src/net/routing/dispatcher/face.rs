@@ -228,7 +228,25 @@ impl Primitives for Face {
                 msg.wire_expr.as_ref(),
                 msg.mode,
                 msg.options,
-                &mut |p, m| declares.push((p.clone(), m)),
+                &mut |p, m| {
+                    // if let DeclareBody::DeclareToken(tok) = &m.msg.body {
+                    //     // println!("{}", std::backtrace::Backtrace::force_capture());
+                    //     if let Some(mux) = p.as_any().downcast_ref::<Mux>() {
+                    //         dbg!((
+                    //             tok,
+                    //             self.state.zid,
+                    //             mux.face.get().unwrap().state.upgrade().unwrap().zid
+                    //         ));
+                    //     } else {
+                    //         if let Some(sess) = p.as_any().downcast_ref::<WeakSession>() {
+                    //             dbg!((tok, self.state.zid, sess.runtime.zid()));
+                    //         } else {
+                    //             dbg!((tok, self.state.zid));
+                    //         }
+                    //     }
+                    // }
+                    declares.push((p.clone(), m))
+                },
             );
             drop(ctrl_lock);
             for (p, m) in declares {
@@ -329,7 +347,25 @@ impl Primitives for Face {
                     &m.wire_expr,
                     msg.ext_nodeid.node_id,
                     msg.interest_id,
-                    &mut |p, m| declares.push((p.clone(), m)),
+                    &mut |p, m| {
+                        // if let DeclareBody::DeclareToken(tok) = &m.msg.body {
+                        //     // println!("{}", std::backtrace::Backtrace::force_capture());
+                        //     if let Some(mux) = p.as_any().downcast_ref::<Mux>() {
+                        //         dbg!((
+                        //             tok,
+                        //             self.state.zid,
+                        //             mux.face.get().unwrap().state.upgrade().unwrap().zid
+                        //         ));
+                        //     } else {
+                        //         if let Some(sess) = p.as_any().downcast_ref::<WeakSession>() {
+                        //             dbg!((tok, self.state.zid, sess.runtime.zid()));
+                        //         } else {
+                        //             dbg!((tok, self.state.zid));
+                        //         }
+                        //     }
+                        // }
+                        declares.push((p.clone(), m))
+                    },
                 );
                 drop(ctrl_lock);
                 for (p, m) in declares {

@@ -18,7 +18,7 @@ use zenoh_config::WhatAmI;
 use zenoh_protocol::network::{
     declare::{common::ext::WireExprType, TokenId},
     ext,
-    interest::{InterestId, InterestMode, InterestOptions},
+    interest::{InterestId, InterestMode},
     Declare, DeclareBody, DeclareToken, UndeclareToken,
 };
 use zenoh_sync::get_mut_unchecked;
@@ -31,124 +31,101 @@ use crate::net::routing::{
     RoutingContext,
 };
 
-fn new_token(
+fn should_route_between(src: &FaceState, dst: &FaceState) -> bool {
+    src.whatami == WhatAmI::Client || dst.whatami == WhatAmI::Client
+}
+
+fn is_new_token(
     tables: &Tables,
-    res: &Arc<Resource>,
-    src_face: &Arc<FaceState>,
-    dst_face: &mut Arc<FaceState>,
+    res: &Resource,
+    src_face: &FaceState,
+    dst_face: &FaceState,
 ) -> bool {
     // Is there any face that
     !res.session_ctxs.values().any(|ctx| {
         ctx.token // declared the token
             && (ctx.face.id != src_face.id) // is not the face that just registered it
             && (ctx.face.id != dst_face.id || dst_face.zid == tables.zid) // is not the face we are propagating to (except for local)
-            && (ctx.face.whatami == WhatAmI::Client || dst_face.whatami == WhatAmI::Client)
+            && should_route_between(&ctx.face, dst_face)
         // don't forward from/to router/peers
     })
 }
 
-#[inline]
-fn propagate_simple_token_to(
-    tables: &mut Tables,
+fn send_declare_token(
+    send_declare: &mut SendDeclare,
     dst_face: &mut Arc<FaceState>,
     res: &Arc<Resource>,
-    src_face: &mut Arc<FaceState>,
-    src_interest_id: Option<InterestId>,
-    dst_interest_id: Option<InterestId>,
-    send_declare: &mut SendDeclare,
+    interest_id: Option<InterestId>,
+    id: TokenId,
 ) {
-    if (src_face.id != dst_face.id || dst_face.zid == tables.zid)
-        && !face_hat!(dst_face).local_tokens.contains_key(res)
-        && (src_face.whatami == WhatAmI::Client || dst_face.whatami == WhatAmI::Client)
-        && new_token(tables, res, src_face, dst_face)
-    {
-        if dst_face.whatami != WhatAmI::Client {
-            let id = face_hat!(dst_face).next_id.fetch_add(1, Ordering::SeqCst);
-            face_hat_mut!(dst_face).local_tokens.insert(res.clone(), id);
-            let key_expr = Resource::decl_key(res, dst_face, dst_face.whatami != WhatAmI::Client);
-            send_declare(
-                &dst_face.primitives,
-                RoutingContext::with_expr(
-                    Declare {
-                        interest_id: dst_interest_id,
-                        ext_qos: ext::QoSType::DECLARE,
-                        ext_tstamp: None,
-                        ext_nodeid: ext::NodeIdType::DEFAULT,
-                        body: DeclareBody::DeclareToken(DeclareToken {
-                            id,
-                            wire_expr: key_expr,
-                        }),
-                    },
-                    res.expr(),
-                ),
-            );
-        } else {
-            let matching_interests = face_hat!(dst_face)
-                .remote_interests
-                .values()
-                .filter(|(r, m, o)| {
-                    o.tokens()
-                        && r.as_ref().map(|r| r.matches(res)).unwrap_or(true)
-                        && (m.current() || src_interest_id.is_none())
-                })
-                .cloned()
-                .collect::<Vec<(Option<Arc<Resource>>, InterestMode, InterestOptions)>>();
-
-            for (int_res, _, options) in matching_interests {
-                let res = if options.aggregate() {
-                    int_res.as_ref().unwrap_or(res)
-                } else {
-                    res
-                };
-                if !face_hat!(dst_face).local_tokens.contains_key(res) {
-                    let id = face_hat!(dst_face).next_id.fetch_add(1, Ordering::SeqCst);
-                    face_hat_mut!(dst_face).local_tokens.insert(res.clone(), id);
-                    let key_expr =
-                        Resource::decl_key(res, dst_face, dst_face.whatami != WhatAmI::Client);
-                    send_declare(
-                        &dst_face.primitives,
-                        RoutingContext::with_expr(
-                            Declare {
-                                interest_id: dst_interest_id,
-                                ext_qos: ext::QoSType::DECLARE,
-                                ext_tstamp: None,
-                                ext_nodeid: ext::NodeIdType::DEFAULT,
-                                body: DeclareBody::DeclareToken(DeclareToken {
-                                    id,
-                                    wire_expr: key_expr,
-                                }),
-                            },
-                            res.expr(),
-                        ),
-                    );
-                }
-            }
-        }
-    }
+    let wire_expr = Resource::decl_key(res, dst_face, dst_face.whatami != WhatAmI::Client);
+    send_declare(
+        &dst_face.primitives,
+        RoutingContext::with_expr(
+            Declare {
+                interest_id,
+                ext_qos: ext::QoSType::DECLARE,
+                ext_tstamp: None,
+                ext_nodeid: ext::NodeIdType::DEFAULT,
+                body: DeclareBody::DeclareToken(DeclareToken { id, wire_expr }),
+            },
+            res.expr(),
+        ),
+    );
 }
 
-fn propagate_simple_token(
+/// Handle known [`InterestMode::Future`] interests in tokens.
+fn handle_future_interest_in_tokens(
     tables: &mut Tables,
-    res: &Arc<Resource>,
+    src_res: &Arc<Resource>,
     src_face: &mut Arc<FaceState>,
-    interest_id: Option<InterestId>,
     send_declare: &mut SendDeclare,
 ) {
-    for mut dst_face in tables
-        .faces
-        .values()
-        .cloned()
-        .collect::<Vec<Arc<FaceState>>>()
-    {
-        propagate_simple_token_to(
-            tables,
-            &mut dst_face,
-            res,
-            src_face,
-            interest_id,
-            None,
-            send_declare,
-        );
+    for dst_face in tables.faces().iter_mut() {
+        if (src_face.id != dst_face.id || dst_face.zid == tables.zid)
+            && !face_hat!(dst_face).local_tokens.contains_key(src_res)
+            && should_route_between(src_face, dst_face)
+            && is_new_token(tables, src_res, src_face, dst_face)
+        {
+            if dst_face.whatami == WhatAmI::Client {
+                let matching_interests = face_hat!(dst_face)
+                    .remote_interests
+                    .values()
+                    .filter(|interest| interest.options.tokens() && interest.matches(src_res))
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                for interest in matching_interests {
+                    let res = interest.resource(src_res);
+                    if !face_hat!(dst_face).local_tokens.contains_key(res) {
+                        let id = make_token_id2(res, dst_face);
+                        dbg!();
+                        eprintln!(
+                            "{} -> {}: DeclareToken(id={}, expr={}, interest_id={:?})",
+                            tables.zid,
+                            dst_face.zid,
+                            id,
+                            src_res.expr(),
+                            Option::<InterestId>::None
+                        );
+                        eprintln!();
+                        send_declare_token(send_declare, dst_face, res, None, id)
+                    }
+                }
+            } else {
+                let id = make_token_id2(src_res, dst_face);
+                dbg!();
+                eprintln!(
+                    "{} -> {}: DeclareToken(id={}, expr={}, interest_id={:?})",
+                    tables.zid,
+                    dst_face.zid,
+                    id,
+                    src_res.expr(),
+                    Option::<InterestId>::None
+                );
+                send_declare_token(send_declare, dst_face, src_res, None, id)
+            }
+        }
     }
 }
 
@@ -187,37 +164,72 @@ fn declare_simple_token(
     interest_id: Option<InterestId>,
     send_declare: &mut SendDeclare,
 ) {
-    if let Some(interest_id) = interest_id {
-        if let Some((interest, _)) = face.pending_current_interests.get(&interest_id) {
-            if interest.mode == InterestMode::Current {
-                let wire_expr = Resource::get_best_key(res, "", interest.src_face.id);
-                send_declare(
-                    &interest.src_face.primitives,
-                    RoutingContext::with_expr(
-                        Declare {
-                            interest_id: Some(interest.src_interest_id),
-                            ext_qos: ext::QoSType::default(),
-                            ext_tstamp: None,
-                            ext_nodeid: ext::NodeIdType::default(),
-                            body: DeclareBody::DeclareToken(DeclareToken { id, wire_expr }),
-                        },
-                        res.expr(),
-                    ),
-                );
-                return;
-            }
-        } else if !face.local_interests.contains_key(&interest_id) {
-            println!(
-                "Received DeclareToken for {} from {} with unknown interest_id {}. Ignore.",
-                res.expr(),
-                face,
-                interest_id,
-            );
-            return;
-        }
-    }
     register_simple_token(tables, face, id, res);
-    propagate_simple_token(tables, res, face, interest_id, send_declare);
+
+    if let Some(interest_id) = interest_id {
+        handle_current_interest_in_tokens(tables, face, id, res, interest_id, send_declare);
+    } else {
+        handle_future_interest_in_tokens(tables, res, face, send_declare);
+    }
+}
+
+/// Handle known [`InterestMode::Current`] and [`InterestMode::CurrentFuture`] interests in tokens.
+fn handle_current_interest_in_tokens(
+    _tables: &mut Tables,
+    face: &mut Arc<FaceState>,
+    id: TokenId,
+    res: &mut Arc<Resource>,
+    interest_id: InterestId,
+    send_declare: &mut SendDeclare,
+) {
+    let Some((interest, _)) = face.pending_current_interests.get(&interest_id) else {
+        // TODO(fuzzypixelz): restore error trace
+        return;
+    };
+
+    dbg!(interest.mode);
+
+    debug_assert_eq!(id, 0);
+    debug_assert!(matches!(
+        interest.mode,
+        InterestMode::Current | InterestMode::CurrentFuture
+    ));
+
+    let dst_face = &mut interest.src_face.clone();
+    // let id = make_token_id2(res, dst_face);
+
+    dbg!();
+    eprintln!(
+        "{} -> {}: DeclareToken(id={}, expr={}, interest_id={:?})",
+        _tables.zid,
+        interest.src_face.zid,
+        id,
+        res.expr(),
+        Some(interest.src_interest_id)
+    );
+    eprintln!();
+
+    let id = face_hat!(dst_face)
+        .local_tokens
+        .get(res)
+        .copied()
+        .unwrap_or(0);
+
+    let wire_expr = Resource::get_best_key(res, "", interest.src_face.id);
+    dbg!(&wire_expr);
+    send_declare(
+        &dst_face.primitives,
+        RoutingContext::with_expr(
+            Declare {
+                interest_id: Some(interest.src_interest_id),
+                ext_qos: ext::QoSType::default(),
+                ext_tstamp: None,
+                ext_nodeid: ext::NodeIdType::default(),
+                body: DeclareBody::DeclareToken(DeclareToken { id, wire_expr }),
+            },
+            res.expr(),
+        ),
+    );
 }
 
 #[inline]
@@ -249,6 +261,7 @@ fn propagate_forget_simple_token(
 ) {
     for mut face in tables.faces.values().cloned() {
         if let Some(id) = face_hat_mut!(&mut face).local_tokens.remove(res) {
+            dbg!("propagate_forget_simple_token", id);
             send_declare(
                 &face.primitives,
                 RoutingContext::with_expr(
@@ -266,10 +279,16 @@ fn propagate_forget_simple_token(
                 ),
             );
         } else if src_face.id != face.id
-            && face_hat!(face).remote_interests.values().any(|(r, _, o)| {
-                o.tokens() && r.as_ref().map(|r| r.matches(res)).unwrap_or(true) && !o.aggregate()
+            && face_hat!(face).remote_interests.values().any(|interest| {
+                dbg!(interest);
+                dbg!(
+                    interest.options.tokens()
+                        && interest.matches(res)
+                        && !interest.options.aggregate()
+                )
             })
         {
+            dbg!();
             // Token has never been declared on this face.
             // Send an Undeclare with a one shot generated id and a WireExpr ext.
             send_declare(
@@ -318,10 +337,10 @@ fn propagate_forget_simple_token(
                             res.expr(),
                         ),
                     );
-                } else if face_hat!(face).remote_interests.values().any(|(r, _, o)| {
-                    o.tokens()
-                        && r.as_ref().map(|r| r.matches(&res)).unwrap_or(true)
-                        && !o.aggregate()
+                } else if face_hat!(face).remote_interests.values().any(|interest| {
+                    interest.options.tokens()
+                        && interest.matches(&res)
+                        && !interest.options.aggregate()
                 }) {
                     // Token has never been declared on this face.
                     // Send an Undeclare with a one shot generated id and a WireExpr ext.
@@ -446,25 +465,39 @@ fn forget_simple_token(
 
 pub(super) fn token_new_face(
     tables: &mut Tables,
-    face: &mut Arc<FaceState>,
+    dst_face: &mut Arc<FaceState>,
     send_declare: &mut SendDeclare,
 ) {
-    if face.whatami != WhatAmI::Client {
-        for mut src_face in tables
-            .faces
-            .values()
-            .cloned()
-            .collect::<Vec<Arc<FaceState>>>()
-        {
-            for token in face_hat!(src_face.clone()).remote_tokens.values() {
-                propagate_simple_token_to(
-                    tables,
-                    face,
-                    token,
-                    &mut src_face,
-                    None,
-                    Some(INITIAL_INTEREST_ID),
+    if dst_face.whatami == WhatAmI::Client {
+        return;
+    }
+
+    for src_face in tables.faces().iter_mut() {
+        for src_res in face_hat!(src_face.clone()).remote_tokens.values() {
+            if (src_face.id != dst_face.id || dst_face.zid == tables.zid)
+                && !face_hat!(dst_face).local_tokens.contains_key(src_res)
+                && should_route_between(src_face, dst_face)
+                && is_new_token(tables, src_res, src_face, dst_face)
+            {
+                let id = face_hat!(dst_face).next_id.fetch_add(1, Ordering::SeqCst);
+                face_hat_mut!(dst_face)
+                    .local_tokens
+                    .insert(src_res.clone(), id);
+                dbg!();
+                eprintln!(
+                    "{} -> {}: DeclareToken(id={}, expr={}, interest_id={:?})",
+                    tables.zid,
+                    dst_face.zid,
+                    id,
+                    src_res.expr(),
+                    Some(INITIAL_INTEREST_ID)
+                );
+                send_declare_token(
                     send_declare,
+                    dst_face,
+                    src_res,
+                    Some(INITIAL_INTEREST_ID),
+                    id,
                 );
             }
         }
@@ -483,6 +516,17 @@ fn make_token_id(res: &Arc<Resource>, face: &mut Arc<FaceState>, mode: InterestM
         }
     } else {
         0
+    }
+}
+
+#[inline]
+fn make_token_id2(res: &Arc<Resource>, face: &mut Arc<FaceState>) -> TokenId {
+    if let Some(id) = face_hat!(face).local_tokens.get(res) {
+        *id
+    } else {
+        let id = face_hat!(face).next_id.fetch_add(1, Ordering::SeqCst);
+        face_hat_mut!(face).local_tokens.insert(res.clone(), id);
+        id
     }
 }
 
@@ -507,6 +551,16 @@ pub(crate) fn declare_token_interest(
                 }) {
                     let id = make_token_id(res, face, mode);
                     let wire_expr = Resource::decl_key(res, face, face.whatami != WhatAmI::Client);
+                    dbg!();
+                    eprintln!(
+                        "{} -> {}: DeclareToken(id={}, expr={}, interest_id={:?})",
+                        tables.zid,
+                        face.zid,
+                        id,
+                        res.expr(),
+                        interest_id
+                    );
+                    eprintln!();
                     send_declare(
                         &face.primitives,
                         RoutingContext::with_expr(
@@ -534,6 +588,14 @@ pub(crate) fn declare_token_interest(
                             let id = make_token_id(token, face, mode);
                             let wire_expr =
                                 Resource::decl_key(token, face, face.whatami != WhatAmI::Client);
+                            dbg!();
+                            eprintln!(
+                                "{} -> {}: DeclareToken(id={}, expr={})",
+                                tables.zid,
+                                face.zid,
+                                id,
+                                res.expr()
+                            );
                             send_declare(
                                 &face.primitives,
                                 RoutingContext::with_expr(
@@ -566,6 +628,14 @@ pub(crate) fn declare_token_interest(
                     let id = make_token_id(token, face, mode);
                     let wire_expr =
                         Resource::decl_key(token, face, face.whatami != WhatAmI::Client);
+                    dbg!();
+                    eprintln!(
+                        "{} -> {}: DeclareToken(id={}, expr={})",
+                        tables.zid,
+                        face.zid,
+                        id,
+                        token.expr()
+                    );
                     send_declare(
                         &face.primitives,
                         RoutingContext::with_expr(

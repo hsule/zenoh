@@ -203,6 +203,18 @@ impl SessionState {
 
     #[inline]
     fn get_res(&self, id: &ExprId, mapping: Mapping, local: bool) -> Option<&Resource> {
+        // dbg!(id, mapping, local);
+        // dbg!(self
+        //     .local_resources
+        //     .iter()
+        //     .map(|(id, res)| (id, res.name()))
+        //     .collect::<Vec<_>>());
+        // dbg!(self
+        //     .remote_resources
+        //     .iter()
+        //     .map(|(id, res)| (id, res.name()))
+        //     .collect::<Vec<_>>());
+
         if local {
             self.get_local_res(id)
         } else {
@@ -1596,10 +1608,15 @@ impl SessionInner {
         let known_tokens = if history {
             state
                 .remote_tokens
-                .values()
-                .filter(|token| key_expr.intersects(token))
-                .cloned()
-                .collect::<Vec<KeyExpr<'static>>>()
+                .iter()
+                .filter_map(|(id, token)| {
+                    if key_expr.intersects(token) {
+                        Some((*id, token.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<(TokenId, KeyExpr<'static>)>>()
         } else {
             vec![]
         };
@@ -1607,10 +1624,19 @@ impl SessionInner {
         let primitives = state.primitives()?;
         drop(state);
 
+        let zid = self.zid();
+
         if !known_tokens.is_empty() {
             self.task_controller
                 .spawn_with_rt(zenoh_runtime::ZRuntime::Net, async move {
-                    for token in known_tokens {
+                    for (id, token) in known_tokens {
+                        dbg!();
+                        eprintln!(
+                            "{zid} -> {zid}: DeclareToken(id={}, expr={}, interest_id=n/a) (session local)",
+                            id,
+                            &token,
+                        );
+                        eprintln!();
                         callback.call(Sample {
                             key_expr: token,
                             payload: ZBytes::empty(),
@@ -1665,7 +1691,7 @@ impl SessionInner {
                     ext_tstamp: None,
                     ext_nodeid: ext::NodeIdType::DEFAULT,
                     body: DeclareBody::UndeclareToken(UndeclareToken {
-                        id: tok_state.id,
+                        id: dbg!(tok_state.id),
                         ext_wire_expr: WireExprType::null(),
                     }),
                 });
@@ -1858,6 +1884,7 @@ impl SessionInner {
         if key_expr.suffix.is_empty() {
             match state.get_res(&key_expr.scope, key_expr.mapping, local) {
                 Some(Resource::Node(res)) => {
+                    // dbg!(&res.key_expr);
                     for sub in res.subscribers(kind) {
                         if sub.origin == Locality::Any
                             || (local == (sub.origin == Locality::SessionLocal))
@@ -1881,6 +1908,7 @@ impl SessionInner {
         } else {
             match state.wireexpr_to_keyexpr(key_expr, local) {
                 Ok(key_expr) => {
+                    // dbg!(&key_expr);
                     for sub in state.subscribers(kind).values() {
                         if (sub.origin == Locality::Any
                             || (local == (sub.origin == Locality::SessionLocal)))
@@ -2145,7 +2173,7 @@ impl SessionInner {
     ) -> ZResult<()> {
         tracing::trace!("liveliness.get({}, {:?})", key_expr, timeout);
         let mut state = zwrite!(self.state);
-        let id = state.liveliness_qid_counter.fetch_add(1, Ordering::SeqCst);
+        let id = self.runtime.next_id();
         let token = self.task_controller.get_cancellation_token();
         self.task_controller
             .spawn_with_rt(zenoh_runtime::ZRuntime::Net, {
@@ -2368,13 +2396,26 @@ impl Primitives for WeakSession {
                 if state.primitives.is_none() {
                     return; // Session closing or closed
                 }
+
                 match state
                     .wireexpr_to_keyexpr(&m.wire_expr, false)
                     .map(|e| e.into_owned())
                 {
                     Ok(key_expr) => {
+                        dbg!();
+                        eprintln!(
+                            "{} -> {}: DeclareToken(id={}, expr={}, interest_id={:?})",
+                            self.zid(),
+                            self.zid(),
+                            m.id,
+                            key_expr,
+                            msg.interest_id
+                        );
+                        eprintln!();
+
                         if let Some(interest_id) = msg.interest_id {
                             if let Some(query) = state.liveliness_queries.get(&interest_id) {
+                                dbg!(&key_expr);
                                 let reply = Reply {
                                     result: Ok(Sample {
                                         key_expr,
@@ -2398,10 +2439,10 @@ impl Primitives for WeakSession {
                                 return;
                             }
                         }
+                        // NOTE: the token id here will never be 0 because if we're here it means we are in Future or CurrentFuture mode
                         if let Entry::Vacant(e) = state.remote_tokens.entry(m.id) {
-                            e.insert(key_expr.clone());
+                            e.insert(dbg!(key_expr.clone()));
                             drop(state);
-
                             self.execute_subscriber_callbacks(
                                 false,
                                 &m.wire_expr,
@@ -2424,11 +2465,29 @@ impl Primitives for WeakSession {
                 trace!("recv UndeclareToken {:?}", m.id);
                 #[cfg(feature = "unstable")]
                 {
+                    dbg!();
+                    eprintln!(
+                        "{} -> {}: UndeclareToken(id={}, wire_expr={:?}, interest_id=n/a)",
+                        self.zid(),
+                        self.zid(),
+                        m.id,
+                        m.ext_wire_expr.wire_expr,
+                    );
+                    eprintln!();
+
+                    dbg!(m.ext_wire_expr.wire_expr == WireExpr::empty());
+                    dbg!(m.ext_wire_expr.wire_expr.mapping);
+
                     let mut state = zwrite!(self.state);
                     if state.primitives.is_none() {
+                        dbg!();
                         return; // Session closing or closed
                     }
+
+                    dbg!(state.remote_tokens.get(&m.id));
+
                     if let Some(key_expr) = state.remote_tokens.remove(&m.id) {
+                        dbg!();
                         drop(state);
 
                         let data_info = DataInfo {
@@ -2453,6 +2512,7 @@ impl Primitives for WeakSession {
                             .map(|e| e.into_owned())
                         {
                             Ok(key_expr) => {
+                                dbg!();
                                 drop(state);
 
                                 let data_info = DataInfo {
@@ -2480,6 +2540,7 @@ impl Primitives for WeakSession {
                             }
                         }
                     }
+                    dbg!();
                 }
             }
             DeclareBody::DeclareFinal(DeclareFinal) => {

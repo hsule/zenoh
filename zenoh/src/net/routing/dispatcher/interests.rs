@@ -13,6 +13,7 @@
 //
 
 use std::{
+    fmt,
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -47,6 +48,38 @@ pub(crate) struct CurrentInterest {
     pub(crate) src_face: Arc<FaceState>,
     pub(crate) src_interest_id: InterestId,
     pub(crate) mode: InterestMode,
+}
+
+#[derive(PartialEq, Clone)]
+pub(crate) struct RemoteInterest {
+    pub(crate) res: Option<Arc<Resource>>,
+    pub(crate) options: InterestOptions,
+}
+
+impl fmt::Debug for RemoteInterest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteInterest")
+            .field("res", &self.res.as_ref().map(|res| res.expr()))
+            .field("options", &self.options)
+            .finish()
+    }
+}
+
+impl RemoteInterest {
+    pub(crate) fn matches(&self, res: &Arc<Resource>) -> bool {
+        self.res.as_ref().map(|r| r.matches(res)).unwrap_or(true)
+    }
+
+    pub(crate) fn resource<'c, 'a: 'c, 'b: 'c>(
+        &'a self,
+        default: &'b Arc<Resource>,
+    ) -> &'c Arc<Resource> {
+        if self.options.aggregate() {
+            self.res.as_ref().unwrap_or(default)
+        } else {
+            default
+        }
+    }
 }
 
 pub(crate) fn declare_final(
@@ -204,6 +237,18 @@ pub(crate) fn declare_interest(
                     (res, wtables)
                 };
 
+                dbg!();
+                eprintln!(
+                    "{} -> {}: Interest(id={}, expr={}, mode={:?}, tokens={})",
+                    face.zid,
+                    wtables.zid,
+                    id,
+                    res.expr(),
+                    mode,
+                    options.tokens(),
+                );
+                eprintln!();
+
                 hat_code.declare_interest(
                     &mut wtables,
                     tables_ref,
@@ -224,6 +269,17 @@ pub(crate) fn declare_interest(
         }
     } else {
         let mut wtables = zwrite!(tables_ref.tables);
+
+        dbg!();
+        eprintln!(
+            "{} -> {}: Interest(id={}, expr=<none>, mode={:?}, tokens={})",
+            face.zid,
+            wtables.zid,
+            id,
+            mode,
+            options.tokens(),
+        );
+
         hat_code.declare_interest(
             &mut wtables,
             tables_ref,

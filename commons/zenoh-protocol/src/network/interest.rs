@@ -80,6 +80,25 @@ pub mod flag {
 ///     |                   |    This stops the transmission of subscriber declarations/undeclarations.
 ///     |                   |              
 ///
+/// And the message flow is the following for an [`Interest`] with mode [`InterestMode::Future`]:
+///
+/// ```text
+///     A                   B
+///     |     INTEREST      |
+///     |------------------>| -- This is a DeclareInterest e.g. for subscriber declarations/undeclarations.
+///     |                   |
+///     |  DECL SUBSCRIBER  |
+///     |<------------------| -- With interest_id field not set
+///     | UNDECL SUBSCRIBER |
+///     |<------------------| -- With interest_id field not set
+///     |                   |
+///     |        ...        |
+///     |                   |
+///     | INTEREST FINAL    |
+///     |------------------>| -- Mode: Final
+///     |                   |    This stops the transmission of subscriber declarations/undeclarations.
+///     |                   |              
+///
 /// Flags:
 /// - |: Mode           The mode of the interest*
 /// -/

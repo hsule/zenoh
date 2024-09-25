@@ -371,7 +371,7 @@ async fn test_liveliness_after_close() {
     use zenoh_config::EndPoint;
     const TIMEOUT: Duration = Duration::from_secs(60);
     const SLEEP: Duration = Duration::from_secs(1);
-    const PEER1_ENDPOINT: &str = "tcp/localhost:47447";
+    const PEER1_ENDPOINT: &str = "tcp/localhost:47510";
     const LIVELINESS_KEYEXPR: &str = "test/liveliness/subscriber/clique";
 
     zenoh_util::init_log_from_env_or("error");
@@ -1408,10 +1408,10 @@ async fn test_liveliness_subscriber_double_peer_history_before() {
 #[cfg(feature = "unstable")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_liveliness_subscriber_double_peer_history_middle() {
-    use std::time::Duration;
+    use std::{str::FromStr, time::Duration};
 
     use zenoh::sample::SampleKind;
-    use zenoh_config::WhatAmI;
+    use zenoh_config::{WhatAmI, ZenohId};
     use zenoh_link::EndPoint;
 
     const TIMEOUT: Duration = Duration::from_secs(60);
@@ -1423,6 +1423,7 @@ async fn test_liveliness_subscriber_double_peer_history_middle() {
 
     let router = {
         let mut c = zenoh::Config::default();
+        c.set_id(ZenohId::from_str("a").unwrap()).unwrap();
         c.listen
             .endpoints
             .set(vec![ROUTER_ENDPOINT.parse::<EndPoint>().unwrap()])
@@ -1436,6 +1437,7 @@ async fn test_liveliness_subscriber_double_peer_history_middle() {
 
     let peer_sub = {
         let mut c = zenoh::Config::default();
+        c.set_id(ZenohId::from_str("b").unwrap()).unwrap();
         c.connect
             .endpoints
             .set(vec![ROUTER_ENDPOINT.parse::<EndPoint>().unwrap()])
@@ -1456,6 +1458,7 @@ async fn test_liveliness_subscriber_double_peer_history_middle() {
 
     let client_tok = {
         let mut c = zenoh::Config::default();
+        c.set_id(ZenohId::from_str("c").unwrap()).unwrap();
         c.connect
             .endpoints
             .set(vec![ROUTER_ENDPOINT.parse::<EndPoint>().unwrap()])
@@ -2602,10 +2605,10 @@ async fn test_liveliness_subscriber_double_clientviapeer_after() {
 #[cfg(feature = "unstable")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_liveliness_subscriber_double_clientviapeer_history_before() {
-    use std::time::Duration;
+    use std::{str::FromStr, time::Duration};
 
     use zenoh::sample::SampleKind;
-    use zenoh_config::WhatAmI;
+    use zenoh_config::{WhatAmI, ZenohId};
     use zenoh_link::EndPoint;
 
     const TIMEOUT: Duration = Duration::from_secs(60);
@@ -2619,6 +2622,7 @@ async fn test_liveliness_subscriber_double_clientviapeer_history_before() {
 
     let router = {
         let mut c = zenoh::Config::default();
+        c.set_id(ZenohId::from_str("a").unwrap()).unwrap();
         c.listen
             .endpoints
             .set(vec![ROUTER_ENDPOINT.parse::<EndPoint>().unwrap()])
@@ -2632,6 +2636,7 @@ async fn test_liveliness_subscriber_double_clientviapeer_history_before() {
 
     let peer_dummy = {
         let mut c = zenoh::Config::default();
+        c.set_id(ZenohId::from_str("b").unwrap()).unwrap();
         c.listen
             .endpoints
             .set(vec![PEER_DUMMY_ENDPOINT.parse::<EndPoint>().unwrap()])
@@ -2649,6 +2654,7 @@ async fn test_liveliness_subscriber_double_clientviapeer_history_before() {
 
     let client_tok = {
         let mut c = zenoh::Config::default();
+        c.set_id(ZenohId::from_str("c0").unwrap()).unwrap();
         c.connect
             .endpoints
             .set(vec![ROUTER_ENDPOINT.parse::<EndPoint>().unwrap()])
@@ -2665,6 +2671,7 @@ async fn test_liveliness_subscriber_double_clientviapeer_history_before() {
 
     let client_sub = {
         let mut c = zenoh::Config::default();
+        c.set_id(ZenohId::from_str("c1").unwrap()).unwrap();
         c.connect
             .endpoints
             .set(vec![PEER_DUMMY_ENDPOINT.parse::<EndPoint>().unwrap()])
@@ -3365,10 +3372,10 @@ async fn test_liveliness_subget_client_history_middle() {
 #[cfg(feature = "unstable")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_liveliness_subget_peer_before() {
-    use std::time::Duration;
+    use std::{str::FromStr, time::Duration};
 
     use zenoh::sample::SampleKind;
-    use zenoh_config::WhatAmI;
+    use zenoh_config::{WhatAmI, ZenohId};
     use zenoh_link::EndPoint;
 
     const TIMEOUT: Duration = Duration::from_secs(60);
@@ -3380,6 +3387,7 @@ async fn test_liveliness_subget_peer_before() {
 
     let router = {
         let mut c = zenoh::Config::default();
+        c.set_id(ZenohId::from_str("a").unwrap()).unwrap();
         c.listen
             .endpoints
             .set(vec![ROUTER_ENDPOINT.parse::<EndPoint>().unwrap()])
@@ -3393,6 +3401,7 @@ async fn test_liveliness_subget_peer_before() {
 
     let client_tok = {
         let mut c = zenoh::Config::default();
+        c.set_id(ZenohId::from_str("c").unwrap()).unwrap();
         c.connect
             .endpoints
             .set(vec![ROUTER_ENDPOINT.parse::<EndPoint>().unwrap()])
@@ -3409,6 +3418,7 @@ async fn test_liveliness_subget_peer_before() {
 
     let peer_subget = {
         let mut c = zenoh::Config::default();
+        c.set_id(ZenohId::from_str("b").unwrap()).unwrap();
         c.connect
             .endpoints
             .set(vec![ROUTER_ENDPOINT.parse::<EndPoint>().unwrap()])
@@ -4256,7 +4266,7 @@ async fn test_liveliness_regression_2() {
     const TIMEOUT: Duration = Duration::from_secs(60);
     const SLEEP: Duration = Duration::from_secs(1);
     const PEER_TOK1_ENDPOINT: &str = "tcp/localhost:47505";
-    const PEER_SUB_ENDPOINT: &str = "tcp/localhost:47506";
+    const PEER_SUB_ENDPOINT: &str = "tcp/localhost:47511";
     const LIVELINESS_KEYEXPR: &str = "test/liveliness/regression/2";
 
     zenoh_util::init_log_from_env_or("error");
