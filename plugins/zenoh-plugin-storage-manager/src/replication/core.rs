@@ -16,16 +16,13 @@ mod aligner_query;
 mod aligner_reply;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
 use rand::Rng;
-use tokio::{
-    sync::{Mutex, RwLock},
-    task::JoinHandle,
-};
+use tokio::{sync::RwLock, task::JoinHandle};
 use tracing::{debug_span, Instrument};
 use zenoh::{
     key_expr::{
@@ -34,13 +31,16 @@ use zenoh::{
     },
     query::{ConsolidationMode, Selector},
     sample::Locality,
+    time::Timestamp,
     Session,
 };
-use zenoh_backend_traits::Storage;
 
 use self::aligner_reply::AlignmentReply;
-use super::{digest::Digest, log::LogLatest};
-use crate::{replication::core::aligner_query::AlignmentQuery, storages_mgt::LatestUpdates};
+use super::{digest::Digest, log::LogLatest, Action, Event};
+use crate::{
+    replication::core::aligner_query::AlignmentQuery,
+    storages_mgt::{LatestUpdates, StorageService},
+};
 
 kedefine!(
     pub digest_key_expr_formatter: "@-digest/${zid:*}/${hash_configuration:*}",
@@ -53,7 +53,7 @@ pub(crate) struct Replication {
     pub(crate) replication_log: Arc<RwLock<LogLatest>>,
     pub(crate) storage_key_expr: OwnedKeyExpr,
     pub(crate) latest_updates: Arc<RwLock<LatestUpdates>>,
-    pub(crate) storage: Arc<Mutex<Box<dyn Storage>>>,
+    pub(crate) storage_service: Arc<StorageService>,
 }
 
 impl Replication {
@@ -578,4 +578,55 @@ impl Replication {
             }
         })
     }
+}
+
+pub(crate) fn remove_events_overridden_by_wildcard_update(
+    events: &mut HashMap<Option<OwnedKeyExpr>, Event>,
+    prefix: Option<&OwnedKeyExpr>,
+    wildcard_ke: &OwnedKeyExpr,
+    wildcard_ts: Option<&Timestamp>,
+) -> HashSet<Event> {
+    let mut overridden_events = HashSet::default();
+
+    events.retain(|stripped_key_expr, event| {
+        // We only provide the timestamp of the Wildcard Update if the Wildcard Update belongs
+        // in this SubInterval.
+        //
+        // Only then do we need to compare its timestamp with the timestamp of the Events
+        // contained in the SubInterval.
+        if let Some(wildcard_timestamp) = wildcard_ts {
+            if wildcard_timestamp < event.timestamp() {
+                return true;
+            }
+        }
+
+        let full_event_key_expr = match event.action() {
+            Action::Put | Action::Delete => {
+                match crate::prefix(prefix, stripped_key_expr.as_ref()) {
+                    Ok(full_ke) => full_ke,
+                    Err(e) => {
+                        tracing::error!(
+                            "Internal error while attempting to prefix < {:?} > with < {:?} >: \
+                             {e:?}",
+                            stripped_key_expr,
+                            prefix
+                        );
+                        return true;
+                    }
+                }
+            }
+            Action::WildcardPut(wildcard_ke) | Action::WildcardDelete(wildcard_ke) => {
+                wildcard_ke.clone()
+            }
+        };
+
+        if wildcard_ke.includes(&full_event_key_expr) {
+            overridden_events.insert(event.clone());
+            return false;
+        }
+
+        true
+    });
+
+    overridden_events
 }

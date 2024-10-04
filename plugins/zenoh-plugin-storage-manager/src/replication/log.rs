@@ -25,16 +25,42 @@ use super::{
     digest::{Digest, Fingerprint},
 };
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+pub(crate) enum Action {
+    Put,
+    Delete,
+    WildcardPut(OwnedKeyExpr),
+    WildcardDelete(OwnedKeyExpr),
+}
+
+impl From<SampleKind> for Action {
+    fn from(kind: SampleKind) -> Self {
+        match kind {
+            SampleKind::Put => Action::Put,
+            SampleKind::Delete => Action::Delete,
+        }
+    }
+}
+
+impl From<&Action> for SampleKind {
+    fn from(action: &Action) -> Self {
+        match action {
+            Action::Put | Action::WildcardPut(_) => SampleKind::Put,
+            Action::Delete | Action::WildcardDelete(_) => SampleKind::Delete,
+        }
+    }
+}
+
 /// The `EventMetadata` structure contains all the information needed by a replica to assess if it
 /// is missing an [Event] in its log.
 ///
 /// Associating the `action` allows only sending the metadata when the associate action is
 /// [SampleKind::Delete].
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct EventMetadata {
     pub(crate) stripped_key: Option<OwnedKeyExpr>,
     pub(crate) timestamp: Timestamp,
-    pub(crate) action: SampleKind,
+    pub(crate) action: Action,
 }
 
 impl EventMetadata {
@@ -52,7 +78,7 @@ impl From<&Event> for EventMetadata {
         Self {
             stripped_key: event.maybe_stripped_key.clone(),
             timestamp: event.timestamp,
-            action: event.action,
+            action: event.action.clone(),
         }
     }
 }
@@ -62,12 +88,12 @@ impl From<&Event> for EventMetadata {
 ///
 /// When an `Event` is created, its [Fingerprint] is computed, using the `xxhash-rust` crate. This
 /// [Fingerprint] is used to construct the [Digest] associated with the replication log.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Event {
-    pub(crate) maybe_stripped_key: Option<OwnedKeyExpr>,
-    pub(crate) timestamp: Timestamp,
-    pub(crate) action: SampleKind,
-    pub(crate) fingerprint: Fingerprint,
+    maybe_stripped_key: Option<OwnedKeyExpr>,
+    timestamp: Timestamp,
+    action: Action,
+    fingerprint: Fingerprint,
 }
 
 impl From<EventMetadata> for Event {
@@ -80,7 +106,11 @@ impl Event {
     /// Creates a new [Event] with the provided key expression and timestamp.
     ///
     /// This function computes the [Fingerprint] of both using the `xxhash_rust` crate.
-    pub fn new(key_expr: Option<OwnedKeyExpr>, timestamp: Timestamp, action: SampleKind) -> Self {
+    pub fn new(
+        key_expr: Option<OwnedKeyExpr>,
+        timestamp: Timestamp,
+        action: impl Into<Action>,
+    ) -> Self {
         let mut hasher = xxhash_rust::xxh3::Xxh3::default();
         if let Some(key_expr) = &key_expr {
             hasher.update(key_expr.as_bytes());
@@ -91,9 +121,33 @@ impl Event {
         Self {
             maybe_stripped_key: key_expr,
             timestamp,
-            action,
+            action: action.into(),
             fingerprint: hasher.digest().into(),
         }
+    }
+
+    fn compute_fingerprint(&self) -> Fingerprint {
+        let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+        if let Some(key_expr) = &self.maybe_stripped_key {
+            hasher.update(key_expr.as_bytes());
+        }
+        hasher.update(&self.timestamp.get_time().0.to_le_bytes());
+        hasher.update(&self.timestamp.get_id().to_le_bytes());
+
+        hasher.digest().into()
+    }
+
+    pub fn set_timestamp(&mut self, timestamp: Timestamp) {
+        self.timestamp = timestamp;
+        self.fingerprint = self.compute_fingerprint();
+    }
+
+    pub fn set_action(&mut self, action: Action) {
+        self.action = action;
+    }
+
+    pub fn action(&self) -> &Action {
+        &self.action
     }
 
     /// Returns a reference over the key expression associated with this [Event].
@@ -400,6 +454,48 @@ impl LogLatest {
             warm_era_fingerprints,
             hot_era_fingerprints,
         }
+    }
+
+    /// Removes and returns the [Event]s overridden by the provided Wildcard Update from the
+    /// Replication Log.
+    ///
+    /// The affected `Interval` and `SubInterval` will have their [Fingerprint] updated accordingly.
+    ///
+    /// # Error
+    ///
+    /// This method will return an error if the call to obtain the time classification of the
+    /// Wildcard Update failed. This should only happen if the Timestamp is far in the future or if
+    /// the internal clock of the host system is misconfigured.
+    pub(crate) fn remove_events_overridden_by_wildcard_update(
+        &mut self,
+        wildcard_key_expr: &OwnedKeyExpr,
+        wildcard_timestamp: &Timestamp,
+    ) -> ZResult<HashSet<Event>> {
+        let (wildcard_interval_idx, wildcard_sub_interval_idx) = self
+            .configuration
+            .get_time_classification(wildcard_timestamp)?;
+
+        let mut overridden_events = HashSet::new();
+
+        for (interval_idx, interval) in self.intervals.iter_mut() {
+            if *interval_idx > wildcard_interval_idx {
+                break;
+            }
+
+            let mut wildcard_sub_idx = None;
+            if *interval_idx == wildcard_interval_idx {
+                wildcard_sub_idx = Some(wildcard_sub_interval_idx);
+            }
+
+            overridden_events.extend(interval.remove_events_overridden_by_wildcard_update(
+                self.configuration.prefix(),
+                wildcard_key_expr,
+                wildcard_timestamp,
+                wildcard_sub_idx,
+            ));
+        }
+
+        Ok(overridden_events)
     }
 }
 

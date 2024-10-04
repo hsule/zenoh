@@ -45,7 +45,7 @@ use zenoh_backend_traits::{
 
 use super::LatestUpdates;
 use crate::{
-    replication::Event,
+    replication::{Action, Event},
     storages_mgt::{CacheLatest, StorageMessage},
 };
 
@@ -53,20 +53,38 @@ pub const WILDCARD_UPDATES_FILENAME: &str = "wildcard_updates";
 pub const TOMBSTONE_FILENAME: &str = "tombstones";
 
 #[derive(Clone)]
-struct Update {
+pub(crate) struct Update {
     kind: SampleKind,
     data: StoredData,
+}
+
+impl Update {
+    pub(crate) fn timestamp(&self) -> &Timestamp {
+        &self.data.timestamp
+    }
+
+    pub(crate) fn kind(&self) -> SampleKind {
+        self.kind
+    }
+
+    pub(crate) fn value(&self) -> &Value {
+        &self.data.value
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        self.data.value
+    }
 }
 
 #[derive(Clone)]
 pub struct StorageService {
     session: Arc<Session>,
-    configuration: StorageConfig,
+    pub(crate) configuration: StorageConfig,
     name: String,
     pub(crate) storage: Arc<Mutex<Box<dyn zenoh_backend_traits::Storage>>>,
     capability: Capability,
     tombstones: Arc<RwLock<KeBoxTree<Timestamp, NonWild, KeyedSetProvider>>>,
-    wildcard_updates: Arc<RwLock<KeBoxTree<Update, UnknownWildness, KeyedSetProvider>>>,
+    pub(crate) wildcard_updates: Arc<RwLock<KeBoxTree<Update, UnknownWildness, KeyedSetProvider>>>,
     cache_latest: CacheLatest,
 }
 
@@ -120,7 +138,10 @@ impl StorageService {
         storage_service
     }
 
-    pub(crate) async fn start_storage_queryable_subscriber(self, mut rx: Receiver<StorageMessage>) {
+    pub(crate) async fn start_storage_queryable_subscriber(
+        self: Arc<Self>,
+        mut rx: Receiver<StorageMessage>,
+    ) {
         // start periodic GC event
         let t = Timer::default();
 
@@ -232,7 +253,26 @@ impl StorageService {
 
         // if wildcard, update wildcard_updates
         if sample.key_expr().is_wild() {
-            self.register_wildcard_update(sample.clone()).await;
+            let sample_key_expr: OwnedKeyExpr = sample.key_expr().clone().into();
+            self.register_wildcard_update(
+                sample_key_expr.clone(),
+                sample.kind(),
+                *sample_timestamp,
+                sample.clone(),
+            )
+            .await;
+
+            self.cache_latest.latest_updates.write().await.insert(
+                Some(sample_key_expr.clone()),
+                Event::new(
+                    Some(sample_key_expr.clone()),
+                    *sample_timestamp,
+                    match sample.kind() {
+                        SampleKind::Put => Action::WildcardPut(sample_key_expr),
+                        SampleKind::Delete => Action::WildcardDelete(sample_key_expr),
+                    },
+                ),
+            );
         }
 
         let matching_keys = if sample.key_expr().is_wild() {
@@ -383,17 +423,34 @@ impl StorageService {
         }
     }
 
-    async fn register_wildcard_update(&self, sample: Sample) {
+    /// Registers a Wildcard Update, storing it in a dedicated in-memory structure and on disk if
+    /// the Storage persistence capability is set to `Durable`.
+    ///
+    /// The `key_expr` and `timestamp` cannot be extracted from the received Sample when aligning
+    /// and hence must be manually passed.
+    ///
+    /// # ⚠️ Cache with Replication
+    ///
+    /// It is the *responsibility of the caller* to insert a Wildcard Update event in the Cache. If
+    /// the Replication is enabled, depending on where this method is called, the event should
+    /// either be inserted in the Cache (to be later added in the Replication Log) or in the
+    /// Replication Log.
+    pub(crate) async fn register_wildcard_update(
+        &self,
+        key_expr: OwnedKeyExpr,
+        kind: SampleKind,
+        timestamp: Timestamp,
+        value: impl Into<Value>,
+    ) {
+        tracing::trace!("Registering Wildcard Update: < {key_expr} >");
         // @TODO: change into a better store that does incremental writes
-        let key = sample.key_expr().clone();
         let mut wildcards = self.wildcard_updates.write().await;
-        let timestamp = *sample.timestamp().unwrap();
         wildcards.insert(
-            &key,
+            &key_expr,
             Update {
-                kind: sample.kind(),
+                kind,
                 data: StoredData {
-                    value: Value::from(sample),
+                    value: value.into(),
                     timestamp,
                 },
             },
@@ -420,7 +477,8 @@ impl StorageService {
         weight.is_some() && weight.unwrap() > timestamp
     }
 
-    async fn overriding_wild_update(
+    // Returns an [Update] if the provided key expression is overridden by a Wildcard Update.
+    pub(crate) async fn overriding_wild_update(
         &self,
         key_expr: &OwnedKeyExpr,
         timestamp: &Timestamp,

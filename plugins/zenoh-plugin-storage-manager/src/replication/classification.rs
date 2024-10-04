@@ -216,6 +216,50 @@ impl Interval {
 
         result
     }
+
+    /// Removes and returns the [Event] present in this `Interval` that are overridden by the
+    /// provided Wildcard Update.
+    ///
+    /// If the Wildcard Update should be recorded in this `Interval` then the index of the
+    /// `SubInterval` should also be provided as the removal can be stopped right after: all the
+    /// [Event]s contained in greater `SubInterval` will, by construction of the Replication Log,
+    /// only have greater timestamps and thus cannot be overridden by this Wildcard Update.
+    pub(crate) fn remove_events_overridden_by_wildcard_update(
+        &mut self,
+        prefix: Option<&OwnedKeyExpr>,
+        wildcard_key_expr: &OwnedKeyExpr,
+        wildcard_timestamp: &Timestamp,
+        wildcard_sub_idx: Option<SubIntervalIdx>,
+    ) -> HashSet<Event> {
+        let mut overridden_events = HashSet::new();
+        for (sub_interval_idx, sub_interval) in self.sub_intervals.iter_mut() {
+            let mut timestamp = None;
+            if let Some(wildcard_sub_idx) = wildcard_sub_idx {
+                if *sub_interval_idx > wildcard_sub_idx {
+                    break;
+                }
+
+                // We only provide the timestamp of the Wildcard Update if the index of the
+                // SubInterval (if provided) equals the index of SubInterval where the Wildcard
+                // Update will be stored.
+                if *sub_interval_idx == wildcard_sub_idx {
+                    timestamp = Some(wildcard_timestamp);
+                }
+            }
+
+            self.fingerprint ^= sub_interval.fingerprint;
+
+            overridden_events.extend(sub_interval.remove_events_overridden_by_wildcard_update(
+                prefix,
+                wildcard_key_expr,
+                timestamp,
+            ));
+
+            self.fingerprint ^= sub_interval.fingerprint;
+        }
+
+        overridden_events
+    }
 }
 
 /// A `SubIntervalIdx` represents the index of a [SubInterval].
@@ -355,6 +399,34 @@ impl SubInterval {
         }
 
         EventRemoval::NotFound
+    }
+
+    /// Removes and returns the [Event] present in this `SubInterval` that are overridden by the
+    /// provided Wildcard Update.
+    ///
+    /// The timestamp of the Wildcard Update should only be provided if the considered `SubInterval`
+    /// is where the Wildcard Update should be recorded.
+    /// It is only in that specific scenario that we are not sure that all [Event]s have a lower
+    /// timestamp.
+    fn remove_events_overridden_by_wildcard_update(
+        &mut self,
+        prefix: Option<&OwnedKeyExpr>,
+        wildcard_key_expr: &OwnedKeyExpr,
+        wildcard_timestamp: Option<&Timestamp>,
+    ) -> HashSet<Event> {
+        let overridden_events =
+            crate::replication::core::remove_events_overridden_by_wildcard_update(
+                &mut self.events,
+                prefix,
+                wildcard_key_expr,
+                wildcard_timestamp,
+            );
+
+        overridden_events
+            .iter()
+            .for_each(|overridden_event| self.fingerprint ^= overridden_event.fingerprint());
+
+        overridden_events
     }
 }
 
