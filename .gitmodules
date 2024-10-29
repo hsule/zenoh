@@ -1,0 +1,3 @@
+[submodule "ringbuffer-spsc"]
+	path = ringbuffer-spsc
+	url = git@github.com:hsule/ringbuffer-spsc.git
