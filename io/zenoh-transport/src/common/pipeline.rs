@@ -399,6 +399,17 @@ struct StageOutIn {
 
 impl StageOutIn {
     #[inline]
+    /// Get the total number of batches currently available in the queue
+    fn len(&self) -> usize {
+        let mut length = self.s_out_r.len(); // Get the number of elements in the ring buffer
+
+        // Check if there is a current batch in `current`
+        if self.current.lock().unwrap().is_some() {
+            length += 1;
+        }
+
+        length
+    }
     fn try_pull(&mut self) -> Pull {
         if let Some(batch) = self.s_out_r.pull() {
             return Pull::Some(batch);
@@ -484,6 +495,11 @@ struct StageOut {
 }
 
 impl StageOut {
+    /// Get the total number of batches currently available in StageOut
+    pub fn len(&self) -> usize {
+        self.s_in.len() // Delegate to StageOutIn's len method
+    }
+
     #[inline]
     fn try_pull(&mut self) -> Pull {
         self.s_in.try_pull()
@@ -505,6 +521,15 @@ impl StageOut {
             batches.push(batch);
         }
         batches
+    }
+}
+
+impl<'a> IntoIterator for &'a mut StageOut {
+    type Item = &'a mut StageOutIn;
+    type IntoIter = std::slice::IterMut<'a, StageOutIn>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        std::slice::from_mut(&mut self.s_in).iter_mut()
     }
 }
 
@@ -634,6 +659,7 @@ impl TransmissionPipelineProducer {
         };
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[idx]);
+        println!("[Producer] push_network_message, Priority: {:?}", priority);
         queue.push_network_message(&mut msg, priority, deadline_before_drop)
     }
 
@@ -647,6 +673,7 @@ impl TransmissionPipelineProducer {
         };
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[priority]);
+        println!("[Producer] push_transport_message, Priority: {:?}", priority);
         queue.push_transport_message(msg)
     }
 
@@ -673,21 +700,27 @@ pub(crate) struct TransmissionPipelineConsumer {
 }
 
 impl TransmissionPipelineConsumer {
+    // hereeee
     pub(crate) async fn pull(&mut self) -> Option<(WBatch, usize)> {
         while self.active.load(Ordering::Relaxed) {
             let mut backoff = MicroSeconds::MAX;
             // Calculate the backoff maximum
             for (prio, queue) in self.stage_out.iter_mut().enumerate() {
+                println!("[-------------] Priority: {:?}, Current length: {}", prio, queue.len());
                 match queue.try_pull() {
                     Pull::Some(batch) => {
+                        println!("[Consumer] Pulled from priority: {:?}, Current length: {}", prio, queue.len());
                         return Some((batch, prio));
                     }
                     Pull::Backoff(deadline) => {
                         if deadline < backoff {
                             backoff = deadline;
                         }
+                        println!("[Consumer] Backoff triggered, deadline in {} microseconds", deadline);
                     }
-                    Pull::None => {}
+                    Pull::None => {
+                        // println!("[Consumer] No data in priority: {}", prio);
+                    }
                 }
             }
 
