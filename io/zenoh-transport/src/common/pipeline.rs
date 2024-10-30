@@ -723,7 +723,7 @@ impl TransmissionPipelineProducer {
         let mut deadline = Deadline::new(Some(wait_time));
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[idx]);
-        println!("[Producer] push_network_message, Priority: {:?}", priority);
+        tracing::info!("[Producer] push_network_message, Priority: {:?}", priority);
         queue.push_network_message(&mut msg, priority, &mut deadline)
     }
 
@@ -737,7 +737,7 @@ impl TransmissionPipelineProducer {
         };
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[priority]);
-        println!("[Producer] push_transport_message, Priority: {:?}", priority);
+        tracing::info!("[Producer] push_transport_message, Priority: {:?}", priority);
         queue.push_transport_message(msg)
     }
 
@@ -770,18 +770,20 @@ impl TransmissionPipelineConsumer {
             let mut backoff = MicroSeconds::MAX;
             // Calculate the backoff maximum
             for (prio, queue) in self.stage_out.iter_mut().enumerate() {
-                println!("[-------------] Priority: {:?}, Current length: {}", prio, queue.len());
+                tracing::info!("[Consumer] Priority: {:?}, Current length: {}", prio, queue.len());
                 match queue.try_pull() {
                     Pull::Some(batch) => {
-                        println!("[Consumer] Pulled from priority: {:?}, Current length: {}", prio, queue.len());
+                        // println!("[Consumer] Pulled from priority: {:?}, Current length: {}", prio, queue.len());
                         return Some((batch, prio));
                     }
                     Pull::Backoff(deadline) => {
                         backoff = deadline;
-                        println!("[Consumer] Backoff triggered, deadline in {} microseconds", deadline);
+                        // println!("[Consumer] Backoff triggered, deadline in {} microseconds", deadline);
                         break;
                     }
-                    Pull::None => {}
+                    Pull::None => {
+                        // println!("[Consumer] No data in priority: {}", prio);
+                    }
                 }
             }
 
