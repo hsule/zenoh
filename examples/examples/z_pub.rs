@@ -14,8 +14,9 @@
 use std::time::Duration;
 
 use clap::Parser;
-use zenoh::{bytes::Encoding, key_expr::KeyExpr, Config};
+use zenoh::{bytes::{Encoding, ZBytes}, key_expr::KeyExpr, Config};
 use zenoh_examples::CommonArgs;
+use serde_json::json;
 
 #[tokio::main]
 async fn main() {
@@ -54,11 +55,30 @@ async fn main() {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let buf = format!("[{idx:4}] {payload}");
         println!("Putting Data ('{}': '{}')...", &key_expr, buf);
-        // Refer to z_bytes.rs to see how to serialize different types of message
+         // Refer to z_bytes.rs to see how to serialize different types of message
+        let attachment_json = attachment.as_ref().map(|s| {
+            match s.split(',').collect::<Vec<_>>().as_slice() {
+                [bw_str, fresh_str] => {
+                    let bw = bw_str.parse::<u64>().unwrap_or(100);
+                    let freshness = fresh_str.parse::<u64>().unwrap_or(20);
+                    let json = json!({ "bw": bw, "freshness": freshness });
+                    ZBytes::from(json.to_string().into_bytes())
+                }
+                _ => {
+                    let fallback = json!({ "bw": 0, "freshness": 0 });
+                    ZBytes::from(fallback.to_string().into_bytes())
+                }
+            }
+        });
+
+        if attachment_json.is_none() {
+            println!("[WARN] attachment_json is None");
+        }
+
         publisher
             .put(buf)
-            .encoding(Encoding::TEXT_PLAIN) // Optionally set the encoding metadata 
-            .attachment(attachment.clone()) // Optionally add an attachment
+            .encoding(Encoding::TEXT_PLAIN)
+            .attachment(attachment_json)
             .await
             .unwrap();
     }
@@ -73,7 +93,7 @@ struct Args {
     /// The payload to write.
     payload: String,
     #[arg(short, long)]
-    /// The attachments to add to each put.
+    /// Ex: --attach "800000,50"
     attach: Option<String>,
     /// Enable matching listener.
     #[cfg(feature = "unstable")]

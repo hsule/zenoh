@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use zenoh_buffers::buffer::SplitBuffer;
 use zenoh_core::zread;
 use zenoh_protocol::{
     core::{key_expr::keyexpr, Reliability, WireExpr},
@@ -323,6 +324,23 @@ pub fn route_data(
                     #[cfg(not(feature = "stats"))]
                     let mut payload = payload();
                     treat_timestamp!(&tables.hlc, payload, tables.drop_future_timestamp);
+
+                    if let PushBody::Put(data) = &payload {
+                        if let Some(attachment) = &data.ext_attachment {
+                            let slices: Vec<&[u8]> = attachment.buffer.slices().collect();
+                            if slices.len() == 1 {
+                                if let Ok(s) = std::str::from_utf8(slices[0]) {
+                                    tracing::info!("[ROUTER] Attachment = {}", s);
+                                } else {
+                                    tracing::info!("[ROUTER] Attachment is not UTF-8: {:?}", slices[0]);
+                                }
+                            } else {
+                                tracing::info!("[ROUTER] Attachment has {} slices, cannot decode", slices.len());
+                            }
+                        } else {
+                            tracing::info!("[ROUTER] No attachment");
+                        }
+                    }
 
                     if route.len() == 1 {
                         let (outface, key_expr, context) = route.values().next().unwrap();
