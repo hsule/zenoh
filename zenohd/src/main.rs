@@ -13,16 +13,29 @@
 //
 use clap::Parser;
 use git_version::git_version;
+use std::collections::HashMap;
+use std::time::Duration;
+use std::time::Instant;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use zenoh::{config::WhatAmI, Config, Result, Wait};
+use zenoh::{
+    config::WhatAmI,
+    key_expr::OwnedKeyExpr,
+    query::{QueryTarget, Selector},
+    Config, Result, Wait,
+};
 use zenoh_config::{EndPoint, ModeDependentValue, PermissionsConf};
 use zenoh_util::LibSearchDirs;
+use serde_json;
 
 const GIT_VERSION: &str = git_version!(prefix = "v", cargo_prefix = "v");
 
 lazy_static::lazy_static!(
     static ref LONG_VERSION: String = format!("{} built with {}", GIT_VERSION, env!("RUSTC_VERSION"));
 );
+
+const METRICS_INTERVAL_SECS: u64 = 1;
+const BLOCK_WEIGHT: u64 = 65535;
+type PeerCapacityMap = HashMap<String, u64>;
 
 #[derive(Debug, Parser)]
 #[command(version=GIT_VERSION, long_version=LONG_VERSION.as_str(), about="The zenoh router")]
@@ -77,7 +90,63 @@ struct Args {
     adminspace_permissions: Option<String>,
 }
 
-fn main() {
+struct Counters {
+    tx_bytes: u64,
+    rx_bytes: u64,
+    tx_msgs: u64,
+    rx_msgs: u64,
+    tx_dropped: u64,
+    rx_dropped: u64,
+}
+
+fn parse_prometheus(metrics: &str) -> HashMap<String, Counters> {
+    let mut map: HashMap<String, Counters> = HashMap::new();
+
+    for line in metrics.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+
+        if let Some((key, val)) = line.rsplit_once(' ') {
+            if let Ok(v) = val.parse::<u64>() {
+                if key.contains("zid=\"") {
+                    if let Some(zid) = key
+                        .split("zid=\"")
+                        .nth(1)
+                        .and_then(|s| s.split('"').next())
+                    {
+                        let zid = zid.to_string();
+                        let entry = map.entry(zid.clone()).or_insert(Counters {
+                            tx_bytes: 0,
+                            rx_bytes: 0,
+                            tx_msgs: 0,
+                            rx_msgs: 0,
+                            tx_dropped: 0,
+                            rx_dropped: 0,
+                        });
+
+                        if key.starts_with("tx_bytes{") {
+                            entry.tx_bytes = v;
+                        } else if key.starts_with("rx_bytes{") {
+                            entry.rx_bytes = v;
+                        } else if key.starts_with("tx_n_msgs{") {
+                            entry.tx_msgs = v;
+                        } else if key.starts_with("rx_n_msgs{") {
+                            entry.rx_msgs = v;
+                        } else if key.starts_with("tx_n_dropped{") {
+                            entry.tx_dropped = v;
+                        } else if key.starts_with("rx_n_dropped{") {
+                            entry.rx_dropped = v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+#[tokio::main]
+async fn main() {
     if let Err(e) = init_logging() {
         eprintln!("{e}. Exiting...");
         std::process::exit(-1);
@@ -86,8 +155,14 @@ fn main() {
     tracing::info!("zenohd {}", *LONG_VERSION);
 
     let args = Args::parse();
-    let config = config_from_args(&args);
+    let (config, peer_cap_map) = config_from_args(&args);
     tracing::info!("Initial conf: {}", &config);
+
+    let mut current_weights: HashMap<String, u64> = HashMap::new();
+    for (zid, capacity) in &peer_cap_map {
+        current_weights.insert(zid.clone(), 100);
+    }
+    tracing::info!("Initialized peer weights monitor with base weights: {:?}", &current_weights);
 
     let _session = match zenoh::open(config).wait() {
         Ok(runtime) => runtime,
@@ -97,11 +172,119 @@ fn main() {
         }
     };
 
+    let zid = _session.zid().to_string();
+    let metrics_key = format!("@/{}/router/metrics/**", zid);
+    let metrics_selector = Selector::from(OwnedKeyExpr::try_from(metrics_key).unwrap());
+    let mut last: Option<(Instant, HashMap<String, Counters>)> = None;
+
+    tokio::spawn({
+        let session = _session.clone();
+        async move {
+            loop {
+                if let Ok(replies) = session
+                    .get(metrics_selector.clone())
+                    .target(QueryTarget::All)
+                    .timeout(Duration::from_secs(2))
+                    .await
+                {
+                    while let Ok(reply) = replies.recv_async().await {
+                        if let Ok(sample) = reply.result() {
+                            let payload = sample.payload().try_to_string().unwrap_or_default();
+                            let now = Instant::now();
+                            let current = parse_prometheus(&payload);
+
+                            if let Some((t0, prev)) = &last {
+                                let dt = now.duration_since(*t0).as_secs_f64();
+                                let mut new_weights_updates = Vec::new();
+
+                                for (zid, cur) in &current {
+                                    if let Some(prev_c) = prev.get(zid) {
+                                        let dtx = cur.tx_bytes.saturating_sub(prev_c.tx_bytes);
+                                        let drx = cur.rx_bytes.saturating_sub(prev_c.rx_bytes);
+
+                                        let throughput_tx = dtx as f64 * 8.0 / dt / 1_000_000.0;
+                                        let throughput_rx = drx as f64 * 8.0 / dt / 1_000_000.0;
+
+                                        let dtx_msgs = cur.tx_msgs.saturating_sub(prev_c.tx_msgs);
+                                        let d_drop = cur.tx_dropped.saturating_sub(prev_c.tx_dropped);
+
+                                        let total_tx = dtx_msgs + d_drop;
+                                        let drop_rate = if total_tx > 0 {
+                                            d_drop as f64 / total_tx as f64 * 100.0
+                                        } else {
+                                            0.0
+                                        };
+
+                                        let capacity = match peer_cap_map.get(zid) {
+                                        Some(cap) => *cap,
+                                        None => {
+                                            tracing::warn!("Unconfigured ZID {} found in metrics. Assuming DEFAULT_CAPACITY of 100 Mbps.", zid);
+                                            100
+                                        }
+                                    };
+                                        let cap_limit = capacity as f64 - 2.0;
+                                        let current_monitored_weight = *current_weights.get(zid).unwrap_or(&100);
+                                        let mut target_weight = current_monitored_weight;
+                                        println!("cap_limit {}",cap_limit);
+
+                                        
+                                        if throughput_tx > cap_limit || throughput_rx > cap_limit {
+                                            target_weight = BLOCK_WEIGHT;
+                                            println!("[DEBUG zid={}] BLOCKKK", zid);
+                                        }
+                                        if current_monitored_weight != target_weight {
+                                            current_weights.insert(zid.clone(), target_weight);
+                                            tracing::info!(
+                                                "Weight change detected for ZID {}. New target weight: {}",
+                                                zid, target_weight
+                                            );
+
+                                            let weight_entry = serde_json::json!({
+                                                "dst_zid": zid, 
+                                                "weight": target_weight
+                                            });
+                                            new_weights_updates.push(weight_entry);
+                                        }
+
+                                        println!(
+                                            "[DEBUG zid={}] tx_msgs={} tx_dropped={} rx_msgs={} rx_dropped={}",
+                                            zid, cur.tx_msgs, cur.tx_dropped, cur.rx_msgs, cur.rx_dropped
+                                        );
+                                        println!(
+                                            "[METRIC {zid}] RX: {:.3} Mbps, TX: {:.3} Mbps, DropRate: {:.2}%",
+                                            throughput_rx, throughput_tx, drop_rate
+                                        );
+                                    }
+                                }
+                                if !new_weights_updates.is_empty() {
+                                    let update_weights_json = serde_json::to_string(&new_weights_updates)
+                                        .expect("Failed to serialize new weights");
+
+                                    let key_expr = format!(
+                                        "@/{}/router/config/routing/router/linkstate/transport_weights", session.zid().to_string()
+                                    );
+
+                                    println!("{}",update_weights_json);
+                                    
+                                    session.put(key_expr,update_weights_json).await.unwrap();
+                                }
+                            }
+
+                            last = Some((now, current));
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(METRICS_INTERVAL_SECS)).await;
+            }
+        }
+    });
+
     std::thread::park();
 }
 
-fn config_from_args(args: &Args) -> Config {
+fn config_from_args(args: &Args) -> (Config, PeerCapacityMap) {
     let mut inline_config = None;
+    let mut peer_capacities_map: PeerCapacityMap = HashMap::new();
     for json in &args.cfg {
         if let Some(("", cfg)) = json.split_once(':') {
             inline_config = Some(cfg);
@@ -251,6 +434,22 @@ fn config_from_args(args: &Args) -> Config {
     for json in &args.cfg {
         if let Some((key, value)) = json.split_once(':') {
             if !key.is_empty() {
+                if key == "peer_caps" {
+                    // 1. Manually add outer braces back, as the shell strips them.
+                    let repaired_value = format!("{{{}}}", value);
+                    
+                    // 2. Use the lenient json5 parser for the final parsing.
+                    match json5::from_str::<PeerCapacityMap>(&repaired_value) { // ⬅️ Must use json5 here
+                        Ok(map) => {
+                            peer_capacities_map.extend(map.clone());
+                            println!("Parsed Peer Capacities Map: {:?}", map);
+                        }
+                        // Ensure you handle the error case gracefully
+                        Err(e) => tracing::error!("Failed to parse peer_caps from --cfg: {}", e),
+                    }
+                    continue;
+                }
+
                 match json5::Deserializer::from_str(value) {
                     Ok(mut deserializer) => {
                         if let Err(e) =
@@ -267,7 +466,7 @@ fn config_from_args(args: &Args) -> Config {
         }
     }
     tracing::debug!("Config: {:?}", &config);
-    config
+    (config, peer_capacities_map)
 }
 
 fn init_logging() -> Result<()> {

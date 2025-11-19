@@ -11,9 +11,9 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::time::Duration;
-
 use clap::Parser;
+use std::{time::{Duration, SystemTime, UNIX_EPOCH}};
+// use prost::bytes::buf;
 use zenoh::{bytes::Encoding, key_expr::KeyExpr, Config};
 use zenoh_examples::CommonArgs;
 
@@ -45,10 +45,30 @@ async fn main() {
             .unwrap();
     }
 
+    const TARGET_MBPS: u128 = 2; // 目標 2 Mbps
+    const PERIOD_MS: u64 = 50;
+
+    let bits_per_sec = TARGET_MBPS * 1_000_000u128;
+    let bits_per_interval = bits_per_sec * (PERIOD_MS as u128) / 1000u128;
+    let bytes_per_interval = (bits_per_interval / 8u128) as usize;
+
+    println!("Waiting for 5 seconds before starting publish loop...");
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
     println!("Press CTRL-C to quit...");
     for idx in 0..u32::MAX {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let buf = format!("[{idx:4}] {payload}");
+        tokio::time::sleep(Duration::from_millis(PERIOD_MS)).await;
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let now_ns = (now.as_secs() as u128) * 1_000_000_000 + now.subsec_nanos() as u128;
+
+        let prefix = format!("[{:4}] ts_ns={} ", idx, now_ns);
+        let payload_len = bytes_per_interval.saturating_sub(prefix.len());
+
+        let payload: String = std::iter::repeat('A').take(payload_len).collect();
+        let buf = prefix + &payload;
+
+
         println!("Putting Data ('{}': '{}')...", &key_expr, buf);
         // Refer to z_bytes.rs to see how to serialize different types of message
         publisher

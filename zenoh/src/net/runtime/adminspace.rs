@@ -426,6 +426,11 @@ impl Primitives for AdminSpace {
                                 e
                             );
                         }
+                        else {
+                            if let Err(e) = self.context.runtime.update_network() {
+                                error!("Failed to manually trigger network update after config change: {}", e);
+                            }
+                        }
                     }
                     Err(e) => error!(
                         "Received non utf8 conf value on @/{}/{}/config/{} : {}",
