@@ -25,6 +25,7 @@ use zenoh_protocol::{
     network::{
         declare::{queryable::ext::QueryableInfoType, QueryableId, SubscriberId, TokenId},
         interest::{InterestId, InterestMode, InterestOptions},
+        push::ext,
         Declare, Oam,
     },
 };
@@ -218,6 +219,7 @@ pub(crate) trait HatPubSubTrait {
         expr: &mut RoutingExpr,
         source: NodeId,
         source_type: WhatAmI,
+        qos: ext::QoSType,
     ) -> Arc<Route>;
 
     fn get_matching_subscriptions(

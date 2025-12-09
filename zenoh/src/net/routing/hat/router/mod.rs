@@ -891,6 +891,16 @@ impl HatBaseTrait for HatCode {
                 .clone(),
             ROUTERS_NET_NAME,
         )?;
+        let router_data_link_weights = link_weights_from_config(
+            config
+                .0
+                .routing()
+                .router()
+                .linkstate()
+                .data_transport_weights()
+                .clone(),
+            ROUTERS_NET_NAME,
+        )?;
         let peer_link_weights = link_weights_from_config(
             config
                 .0
@@ -901,17 +911,46 @@ impl HatBaseTrait for HatCode {
                 .clone(),
             PEERS_NET_NAME,
         )?;
+        let peer_data_link_weights = link_weights_from_config(
+            config
+                .0
+                .routing()
+                .peer()
+                .linkstate()
+                .data_transport_weights()
+                .clone(),
+            PEERS_NET_NAME,
+        )?;
         drop(config);
+
+        let mut router_trees_need_update = false;
+        let mut peer_trees_need_update = false;
+
         if let Some(net) = hat_mut!(tables).routers_net.as_mut() {
             if net.update_link_weights(router_link_weights) {
-                hat_mut!(tables).schedule_compute_trees(tables_ref.clone(), WhatAmI::Router);
+                router_trees_need_update = true;
+            }
+            if net.update_data_link_weights(router_data_link_weights) {
+                router_trees_need_update = true;
             }
         }
+
         if let Some(net) = hat_mut!(tables).linkstatepeers_net.as_mut() {
             if net.update_link_weights(peer_link_weights) {
-                hat_mut!(tables).schedule_compute_trees(tables_ref.clone(), WhatAmI::Peer);
+                peer_trees_need_update = true;
+            }
+            if net.update_data_link_weights(peer_data_link_weights) {
+                peer_trees_need_update = true;
             }
         }
+
+        if router_trees_need_update {
+            hat_mut!(tables).schedule_compute_trees(tables_ref.clone(), WhatAmI::Router);
+        }
+        if peer_trees_need_update {
+            hat_mut!(tables).schedule_compute_trees(tables_ref.clone(), WhatAmI::Peer);
+        }
+
         Ok(())
     }
 

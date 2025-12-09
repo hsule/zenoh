@@ -905,6 +905,7 @@ impl HatPubSubTrait for HatCode {
         expr: &mut RoutingExpr,
         source: NodeId,
         source_type: WhatAmI,
+        qos: ext::QoSType,
     ) -> Arc<Route> {
         #[inline]
         fn insert_faces_for_subs(
@@ -914,13 +915,21 @@ impl HatPubSubTrait for HatCode {
             net: &Network,
             source: NodeId,
             subs: &HashSet<ZenohIdProto>,
+            use_data_tree: bool,
         ) {
-            if net.trees.len() > source as usize {
+            // Select tree based on use_data_tree flag
+            let trees = if use_data_tree {
+                &net.data_trees
+            } else {
+                &net.trees
+            };
+
+            if trees.len() > source as usize {
                 for sub in subs {
                     if let Some(sub_idx) = net.get_idx(sub) {
-                        if net.trees[source as usize].directions.len() > sub_idx.index() {
+                        if trees[source as usize].directions.len() > sub_idx.index() {
                             if let Some(direction) =
-                                net.trees[source as usize].directions[sub_idx.index()]
+                                trees[source as usize].directions[sub_idx.index()]
                             {
                                 if net.graph.contains_node(direction) {
                                     if let Some(face) = tables.get_face(&net.graph[direction].zid) {
@@ -948,11 +957,23 @@ impl HatPubSubTrait for HatCode {
         if key_expr.ends_with('/') {
             return Arc::new(route.build());
         }
+
+        // Determine whether to use data_tree based on QoS priority
+        let priority = qos.get_priority();
+        let use_data_tree = matches!(
+            priority,
+            zenoh_protocol::core::Priority::Data
+                | zenoh_protocol::core::Priority::DataHigh
+                | zenoh_protocol::core::Priority::DataLow
+        );
+
         tracing::trace!(
-            "compute_data_route({}, {:?}, {:?})",
+            "compute_data_route({}, {:?}, {:?}, priority={:?}, use_data_tree={})",
             key_expr,
             source,
-            source_type
+            source_type,
+            priority,
+            use_data_tree
         );
         let key_expr = match OwnedKeyExpr::try_from(key_expr) {
             Ok(ke) => ke,
@@ -983,6 +1004,7 @@ impl HatPubSubTrait for HatCode {
                 net,
                 peer_source,
                 &res_hat!(mres).linkstatepeer_subs,
+                use_data_tree,
             );
 
             for (sid, context) in &mres.session_ctxs {

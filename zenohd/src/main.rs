@@ -261,7 +261,7 @@ async fn main() {
                                         .expect("Failed to serialize new weights");
 
                                     let key_expr = format!(
-                                        "@/{}/router/config/routing/router/linkstate/transport_weights", session.zid().to_string()
+                                        "@/{}/router/config/routing/router/linkstate/data_transport_weights", session.zid().to_string()
                                     );
 
                                     println!("{}",update_weights_json);

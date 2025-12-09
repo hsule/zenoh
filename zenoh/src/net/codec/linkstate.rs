@@ -52,6 +52,9 @@ where
         if x.link_weights.is_some() {
             options |= linkstate::WGT;
         }
+        if x.data_link_weights.is_some() {
+            options |= linkstate::DWGT;
+        }
         codec.write(&mut *writer, options)?;
 
         // Body
@@ -74,6 +77,12 @@ where
         if let Some(link_weights) = x.link_weights.as_ref() {
             // do not write len since it is the same as that of links
             for w in link_weights.iter() {
+                codec.write(&mut *writer, w)?;
+            }
+        }
+        if let Some(data_link_weights) = x.data_link_weights.as_ref() {
+            // do not write len since it is the same as that of links
+            for w in data_link_weights.iter() {
                 codec.write(&mut *writer, w)?;
             }
         }
@@ -130,6 +139,18 @@ where
             None
         };
 
+        let data_link_weights = if imsg::has_option(options, linkstate::DWGT) {
+            // number of data weights is the same as number of links
+            let mut weights: Vec<u16> = Vec::with_capacity(links_len);
+            for _ in 0..links_len {
+                let w: u16 = codec.read(&mut *reader)?;
+                weights.push(w);
+            }
+            Some(weights)
+        } else {
+            None
+        };
+
         Ok(LinkState {
             psid,
             sn,
@@ -138,6 +159,7 @@ where
             locators,
             links,
             link_weights,
+            data_link_weights,
         })
     }
 }

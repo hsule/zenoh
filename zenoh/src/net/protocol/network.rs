@@ -59,6 +59,7 @@ pub(crate) struct Node {
     pub(crate) locators: Option<Vec<Locator>>,
     pub(crate) sn: u64,
     pub(crate) links: HashMap<ZenohIdProto, LinkEdgeWeight>,
+    pub(crate) data_links: HashMap<ZenohIdProto, LinkEdgeWeight>,
 }
 
 impl std::fmt::Debug for Node {
@@ -163,6 +164,7 @@ impl Network {
             locators: None,
             sn: 1,
             links: HashMap::new(),
+            data_links: HashMap::new(),
         });
 
         Network {
@@ -258,17 +260,39 @@ impl Network {
         &mut self,
         data_link_weights: HashMap<ZenohIdProto, LinkEdgeWeight>,
     ) -> bool {
-        let old_weights = self.data_link_weights.clone();
+        let old_weights = self.graph[self.idx].data_links.clone();
+        self.graph[self.idx].data_links = data_link_weights.clone();
         self.data_link_weights = data_link_weights;
 
         tracing::info!(
             "{} Update data link weights to {:?}",
             &self.name,
-            &self.data_link_weights
+            &self.graph[self.idx].data_links
         );
 
-        // Return true if weights changed, indicating trees need recomputation
-        old_weights != self.data_link_weights
+        // Check if weights actually changed
+        if old_weights == self.graph[self.idx].data_links {
+            return false;
+        }
+
+        // Broadcast the update to all neighbors if we're in full linkstate mode
+        if self.full_linkstate || self.router_peers_failover_brokering {
+            self.graph[self.idx].sn += 1;
+            self.send_on_links(
+                vec![(
+                    self.idx,
+                    Details {
+                        zid: false,
+                        links: true,
+                        ..Default::default()
+                    },
+                )],
+                |_link| true,
+            );
+        }
+
+        // Return true indicating trees need recomputation
+        true
     }
 
     pub(crate) fn dot(&self) -> String {
@@ -331,8 +355,10 @@ impl Network {
 
     fn make_link_state(&self, idx: NodeIndex, details: &Details) -> LinkState {
         let mut weights = vec![];
+        let mut data_weights = vec![];
         let mut links = vec![];
         let mut has_non_default_weight = false;
+        let mut has_non_default_data_weight = false;
         if details.links {
             for (dest, weight) in &self.graph[idx].links {
                 match self.get_idx(dest) {
@@ -340,6 +366,15 @@ impl Network {
                         links.push(idx2.index().try_into().unwrap());
                         weights.push(weight.as_raw());
                         has_non_default_weight = has_non_default_weight || weight.is_set();
+
+                        // Get data link weight for this destination from the node's data_links
+                        let data_weight = self.graph[idx]
+                            .data_links
+                            .get(dest)
+                            .copied()
+                            .unwrap_or_default();
+                        data_weights.push(data_weight.as_raw());
+                        has_non_default_data_weight = has_non_default_data_weight || data_weight.is_set();
                     }
                     None => {
                         tracing::error!(
@@ -372,6 +407,7 @@ impl Network {
             },
             links,
             link_weights: has_non_default_weight.then_some(weights),
+            data_link_weights: has_non_default_data_weight.then_some(data_weights),
         }
     }
 
@@ -520,6 +556,7 @@ impl Network {
                         link_state.sn,
                         link_state.links,
                         link_state.link_weights,
+                        link_state.data_link_weights,
                     ))
                 } else {
                     match src_link.get_zid(&link_state.psid) {
@@ -530,6 +567,7 @@ impl Network {
                             link_state.sn,
                             link_state.links,
                             link_state.link_weights,
+                            link_state.data_link_weights,
                         )),
                         None => {
                             tracing::error!(
@@ -549,14 +587,22 @@ impl Network {
 
         link_states
             .into_iter()
-            .map(|(zid, whatami, locators, sn, links, weights)| {
+            .map(|(zid, whatami, locators, sn, links, weights, data_weights)| {
                 let mut edges = HashMap::with_capacity(links.len());
+                let mut data_edges = HashMap::with_capacity(links.len());
                 for i in 0..links.len() {
                     match src_link.get_zid(&links[i]) {
-                        Some(zid) => {
+                        Some(link_zid) => {
                             edges.insert(
-                                *zid,
+                                *link_zid,
                                 weights
+                                    .as_ref()
+                                    .map(|w| LinkEdgeWeight::from_raw(w[i]))
+                                    .unwrap_or_default(),
+                            );
+                            data_edges.insert(
+                                *link_zid,
+                                data_weights
                                     .as_ref()
                                     .map(|w| LinkEdgeWeight::from_raw(w[i]))
                                     .unwrap_or_default(),
@@ -579,6 +625,7 @@ impl Network {
                     whatami,
                     locators,
                     links: edges,
+                    data_links: data_edges,
                 }
             })
             .collect::<Vec<_>>()
@@ -596,6 +643,7 @@ impl Network {
                         locators: ls.locators.clone(),
                         sn: ls.sn,
                         links: ls.links,
+                        data_links: ls.data_links,
                     });
                     changes.updated_nodes.push((idx, self.graph[idx].clone()));
                     if ls.locators.is_none() {
@@ -610,6 +658,7 @@ impl Network {
                     }
                     node.sn = ls.sn;
                     node.links.clone_from(&ls.links);
+                    node.data_links.clone_from(&ls.data_links);
                     changes.updated_nodes.push((idx, node.clone()));
                     if ls.locators.is_none() || node.locators == ls.locators {
                         continue;
@@ -739,6 +788,7 @@ impl Network {
                     if oldsn < ls.sn {
                         node.sn = ls.sn;
                         node.links.clone_from(&ls.links);
+                        node.data_links.clone_from(&ls.data_links);
                         if ls.locators.is_some() {
                             node.locators = ls.locators;
                         }
@@ -760,6 +810,7 @@ impl Network {
                         locators: ls.locators,
                         sn: ls.sn,
                         links: ls.links.clone(),
+                        data_links: ls.data_links.clone(),
                     };
                     tracing::debug!("{} Add node (state) {}", self.name, ls.zid);
                     let idx = self.add_node(node);
@@ -786,6 +837,7 @@ impl Network {
                         locators: None,
                         sn: 0,
                         links: HashMap::new(),
+                        data_links: HashMap::new(),
                     };
                     tracing::debug!("{} Add node (reintroduced) {}", self.name, dest.clone());
                     let idx = self.add_node(node);
@@ -862,6 +914,7 @@ impl Network {
                             locators: None,
                             sn: 0,
                             links: HashMap::new(),
+                            data_links: HashMap::new(),
                         }),
                         true,
                     )
@@ -1158,38 +1211,69 @@ impl Network {
         // Create a temporary graph with data_link_weights for computation
         let mut data_graph = self.graph.clone();
 
-        // Update edges in the temporary graph using data_link_weights
-        for idx1 in &indexes {
-            for idx2 in &indexes {
-                if idx1 < idx2 && self.graph.contains_edge(*idx1, *idx2) {
-                    use std::hash::Hasher;
-                    let mut hasher = std::collections::hash_map::DefaultHasher::default();
-                    let zid1 = data_graph[*idx1].zid;
-                    let zid2 = data_graph[*idx2].zid;
-                    if zid1 > zid2 {
-                        hasher.write(&data_graph[*idx2].zid.to_le_bytes());
-                        hasher.write(&data_graph[*idx1].zid.to_le_bytes());
-                    } else {
-                        hasher.write(&data_graph[*idx1].zid.to_le_bytes());
-                        hasher.write(&data_graph[*idx2].zid.to_le_bytes());
-                    }
+        tracing::debug!("[compute_data_trees] Starting edge weight computation");
+        for idx in &indexes {
+            let node = &data_graph[*idx];
+            tracing::debug!(
+                "[compute_data_trees] Node {} (idx={}): links={:?}, data_links={:?}",
+                node.zid, idx.index(), node.links, node.data_links
+            );
+        }
 
-                    // Use data_link_weights instead of link_weights
-                    let w1 = self.data_link_weights
-                        .get(&zid2)
-                        .and_then(|weight| weight.is_set().then_some(weight.value()));
-                    let w2 = self.data_link_weights
-                        .get(&zid1)
-                        .and_then(|weight| weight.is_set().then_some(weight.value()));
-                    let w = match (w1, w2) {
-                        (None, None) => LinkEdgeWeight::default().value(),
-                        (None, Some(w2)) => w2,
-                        (Some(w1), None) => w1,
-                        (Some(w1), Some(w2)) => w1.max(w2),
-                    };
-                    let weight =
-                        w as f64 * (1.0 + 0.01 * (((hasher.finish() as u32) as f64) / u32::MAX as f64));
-                    data_graph.update_edge(*idx1, *idx2, weight);
+        // Update/add edges in the temporary graph using data_link_weights from each node
+        // We check both node.links (control) and node.data_links (data) to find all possible edges
+        for idx1 in &indexes {
+            let zid1 = data_graph[*idx1].zid;
+
+            // Collect all destinations from both links and data_links
+            let mut all_dests = std::collections::HashSet::new();
+            for dest in data_graph[*idx1].links.keys() {
+                all_dests.insert(*dest);
+            }
+            for dest in data_graph[*idx1].data_links.keys() {
+                all_dests.insert(*dest);
+            }
+
+            for dest_zid in all_dests {
+                if let Some(idx2) = self.get_idx(&dest_zid) {
+                    if idx1 < &idx2 {
+                        use std::hash::Hasher;
+                        let mut hasher = std::collections::hash_map::DefaultHasher::default();
+                        let zid2 = data_graph[idx2].zid;
+
+                        if zid1 > zid2 {
+                            hasher.write(&zid2.to_le_bytes());
+                            hasher.write(&zid1.to_le_bytes());
+                        } else {
+                            hasher.write(&zid1.to_le_bytes());
+                            hasher.write(&zid2.to_le_bytes());
+                        }
+
+                        // Use data_link_weights from each node
+                        let w1 = data_graph[*idx1]
+                            .data_links
+                            .get(&zid2)
+                            .and_then(|weight| weight.is_set().then_some(weight.value()));
+                        let w2 = data_graph[idx2]
+                            .data_links
+                            .get(&zid1)
+                            .and_then(|weight| weight.is_set().then_some(weight.value()));
+                        let w = match (w1, w2) {
+                            (None, None) => LinkEdgeWeight::default().value(),
+                            (None, Some(w2)) => w2,
+                            (Some(w1), None) => w1,
+                            (Some(w1), Some(w2)) => w1.max(w2),
+                        };
+                        let weight =
+                            w as f64 * (1.0 + 0.01 * (((hasher.finish() as u32) as f64) / u32::MAX as f64));
+
+                        tracing::debug!(
+                            "[compute_data_trees] Edge {} <-> {}: w1={:?} w2={:?} final_weight={} (raw={})",
+                            zid1, zid2, w1, w2, weight, w
+                        );
+
+                        data_graph.update_edge(*idx1, idx2, weight);
+                    }
                 }
             }
         }

@@ -490,21 +490,40 @@ impl HatBaseTrait for HatCode {
         tables_ref: &Arc<TablesLock>,
         runtime: &Runtime,
     ) -> ZResult<()> {
-        let peer_link_weights = runtime
-            .config()
-            .lock()
+        let config = runtime.config().lock();
+        let peer_link_weights = config
             .0
             .routing()
             .peer()
             .linkstate()
             .transport_weights()
             .clone();
+        let peer_data_link_weights = config
+            .0
+            .routing()
+            .peer()
+            .linkstate()
+            .data_transport_weights()
+            .clone();
+        drop(config);
+
         let peer_link_weights = link_weights_from_config(peer_link_weights, PEERS_NET_NAME)?;
+        let peer_data_link_weights = link_weights_from_config(peer_data_link_weights, PEERS_NET_NAME)?;
+
+        let mut trees_need_update = false;
         if let Some(net) = hat_mut!(tables).linkstatepeers_net.as_mut() {
             if net.update_link_weights(peer_link_weights) {
-                hat_mut!(tables).schedule_compute_trees(tables_ref.clone());
+                trees_need_update = true;
+            }
+            if net.update_data_link_weights(peer_data_link_weights) {
+                trees_need_update = true;
             }
         }
+
+        if trees_need_update {
+            hat_mut!(tables).schedule_compute_trees(tables_ref.clone());
+        }
+
         Ok(())
     }
 

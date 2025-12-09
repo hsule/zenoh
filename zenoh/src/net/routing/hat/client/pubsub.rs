@@ -330,6 +330,7 @@ impl HatPubSubTrait for HatCode {
         expr: &mut RoutingExpr,
         source: NodeId,
         source_type: WhatAmI,
+        _qos: ext::QoSType,
     ) -> Arc<Route> {
         let mut route = RouteBuilder::new();
         let key_expr = expr.full_expr();

@@ -261,6 +261,7 @@ pub(crate) struct ResourceContext {
     pub(crate) hat: Box<dyn Any + Send + Sync>,
     pub(crate) data_routes: RwLock<DataRoutes>,
     pub(crate) query_routes: RwLock<QueryRoutes>,
+    pub(crate) data_routes_data_tree: RwLock<DataRoutes>,
 }
 
 impl ResourceContext {
@@ -270,11 +271,13 @@ impl ResourceContext {
             hat,
             data_routes: Default::default(),
             query_routes: Default::default(),
+            data_routes_data_tree: Default::default(),
         }
     }
 
     pub(crate) fn disable_data_routes(&mut self) {
         self.data_routes.get_mut().unwrap().clear();
+        self.data_routes_data_tree.get_mut().unwrap().clear();
     }
 
     pub(crate) fn disable_query_routes(&mut self) {

@@ -218,24 +218,50 @@ fn get_data_route(
     res: &Option<Arc<Resource>>,
     expr: &mut RoutingExpr,
     routing_context: NodeId,
+    qos: ext::QoSType,
 ) -> Arc<Route> {
+    let priority = qos.get_priority();
+    let use_data_tree = matches!(
+        priority,
+        zenoh_protocol::core::Priority::Data
+            | zenoh_protocol::core::Priority::DataHigh
+            | zenoh_protocol::core::Priority::DataLow
+    );
+
+    tracing::debug!(
+        "get_data_route: expr={}, qos_priority={:?}, use_data_tree={}, face={}, routing_context={}",
+        expr.full_expr(),
+        priority,
+        use_data_tree,
+        face.zid,
+        routing_context
+    );
+
     let local_context = hat_code.map_routing_context(tables, face, routing_context);
-    let mut compute_route =
-        || hat_code.compute_data_route(tables, expr, local_context, face.whatami);
-    if let Some(data_routes) = res
-        .as_ref()
-        .and_then(|res| res.context.as_ref())
-        .map(|ctx| &ctx.data_routes)
-    {
+
+    if let Some(context) = res.as_ref().and_then(|res| res.context.as_ref()) {
+        // Select cache based on use_data_tree
+        let cache = if use_data_tree {
+            tracing::trace!("Using data_routes_data_tree cache");
+            &context.data_routes_data_tree
+        } else {
+            tracing::trace!("Using data_routes cache");
+            &context.data_routes
+        };
+
+        let compute_route =
+            || hat_code.compute_data_route(tables, expr, local_context, face.whatami, qos);
+
         return get_or_set_route(
-            data_routes,
+            cache,
             tables.routes_version,
             face.whatami,
             local_context,
             compute_route,
         );
     }
-    compute_route()
+
+    hat_code.compute_data_route(tables, expr, local_context, face.whatami, qos)
 }
 
 #[inline]
@@ -320,6 +346,7 @@ pub fn route_data(
                     &res,
                     &mut expr,
                     msg.ext_nodeid.node_id,
+                    msg.ext_qos,
                 );
 
                 if !route.is_empty() {

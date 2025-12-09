@@ -21,10 +21,11 @@ pub const PID: u64 = 1; // 0x01
 pub const WAI: u64 = 1 << 1; // 0x02
 pub const LOC: u64 = 1 << 2; // 0x04
 pub const WGT: u64 = 1 << 3; // 0x08
+pub const DWGT: u64 = 1 << 4; // 0x10
 
 //  7 6 5 4 3 2 1 0
 // +-+-+-+-+-+-+-+-+
-// ~X|X|X|X|H|L|W|P~
+// ~X|X|X|D|H|L|W|P~
 // +-+-+-+-+-+-+-+-+
 // ~     psid      ~
 // +---------------+
@@ -40,6 +41,8 @@ pub const WGT: u64 = 1 << 3; // 0x08
 // +---------------+
 // ~    [weights]  ~ if H = 1
 // +---------------+
+// ~ [data_weights]~ if D = 1
+// +---------------+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinkState {
     pub(crate) psid: u64,
@@ -49,6 +52,7 @@ pub(crate) struct LinkState {
     pub(crate) locators: Option<Vec<Locator>>,
     pub(crate) links: Vec<u64>,
     pub(crate) link_weights: Option<Vec<u16>>,
+    pub(crate) data_link_weights: Option<Vec<u16>>,
 }
 
 #[derive(Default, Copy, Clone, PartialEq, Eq)]
@@ -100,6 +104,7 @@ pub(crate) struct LocalLinkState {
     pub(crate) whatami: WhatAmI,
     pub(crate) locators: Option<Vec<Locator>>,
     pub(crate) links: HashMap<ZenohIdProto, LinkEdgeWeight>,
+    pub(crate) data_links: HashMap<ZenohIdProto, LinkEdgeWeight>,
 }
 
 impl LinkState {
@@ -141,6 +146,8 @@ impl LinkState {
             whatami,
             locators,
             links,
+            link_weights: None,
+            data_link_weights: None,
         }
     }
 }
