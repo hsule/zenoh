@@ -14,7 +14,7 @@
 use clap::Parser;
 use std::{time::{Duration, SystemTime, UNIX_EPOCH}};
 // use prost::bytes::buf;
-use zenoh::{bytes::Encoding, key_expr::KeyExpr, Config};
+use zenoh::{bytes::Encoding, key_expr::KeyExpr, qos::{CongestionControl, Priority}, Config};
 use zenoh_examples::CommonArgs;
 
 #[tokio::main]
@@ -27,17 +27,38 @@ async fn main() {
     println!("Opening session...");
     let session = zenoh::open(config).await.unwrap();
 
-    println!("Declaring Publisher on '{key_expr}'...");
+    println!("Declaring Publisher on '{key_expr}' with DATA priority...");
     let publisher = session.declare_publisher(&key_expr).await.unwrap();
+
+    println!("Declaring REALTIME Publisher on 'demo/example/zenoh-rs-pub-realtime'...");
+    let publisher_realtime = session
+        .declare_publisher("demo/example/zenoh-rs-pub-realtime")
+        .priority(Priority::RealTime)
+        .congestion_control(CongestionControl::Block)
+        .await
+        .unwrap();
 
     if add_matching_listener {
         publisher
             .matching_listener()
             .callback(|matching_status| {
                 if matching_status.matching() {
-                    println!("Publisher has matching subscribers.");
+                    println!("DATA Publisher has matching subscribers.");
                 } else {
-                    println!("Publisher has NO MORE matching subscribers.");
+                    println!("DATA Publisher has NO MORE matching subscribers.");
+                }
+            })
+            .background()
+            .await
+            .unwrap();
+
+        publisher_realtime
+            .matching_listener()
+            .callback(|matching_status| {
+                if matching_status.matching() {
+                    println!("REALTIME Publisher has matching subscribers.");
+                } else {
+                    println!("REALTIME Publisher has NO MORE matching subscribers.");
                 }
             })
             .background()
@@ -62,19 +83,31 @@ async fn main() {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let now_ns = (now.as_secs() as u128) * 1_000_000_000 + now.subsec_nanos() as u128;
 
-        let prefix = format!("[{:4}] ts_ns={} ", idx, now_ns);
-        let payload_len = bytes_per_interval.saturating_sub(prefix.len());
+        // DATA priority publisher
+        let prefix_data = format!("[{:4}] ts_ns={} ", idx, now_ns);
+        let payload_len_data = bytes_per_interval.saturating_sub(prefix_data.len());
+        let payload_data: String = std::iter::repeat('A').take(payload_len_data).collect();
+        let buf_data = prefix_data + &payload_data;
 
-        let payload: String = std::iter::repeat('A').take(payload_len).collect();
-        let buf = prefix + &payload;
-
-
-        println!("Putting Data ('{}': '{}')...", &key_expr, buf);
-        // Refer to z_bytes.rs to see how to serialize different types of message
+        println!("Putting DATA ('{}': '{}')...", &key_expr, buf_data);
         publisher
-            .put(buf)
-            .encoding(Encoding::TEXT_PLAIN) // Optionally set the encoding metadata 
-            .attachment(attachment.clone()) // Optionally add an attachment
+            .put(buf_data)
+            .encoding(Encoding::TEXT_PLAIN)
+            .attachment(attachment.clone())
+            .await
+            .unwrap();
+
+        // REALTIME priority publisher
+        let prefix_rt = format!("[{:4}] ts_ns={} ", idx, now_ns);
+        // let payload_len_rt = bytes_per_interval.saturating_sub(prefix_rt.len());
+        // let payload_rt: String = std::iter::repeat('R').take(payload_len_rt).collect();
+        // let buf_rt = prefix_rt + &payload_rt;
+
+        println!("Putting REALTIME ('demo/example/zenoh-rs-pub-realtime': '{}')...", prefix_rt);
+        publisher_realtime
+            .put(prefix_rt)
+            .encoding(Encoding::TEXT_PLAIN)
+            .attachment(attachment.clone())
             .await
             .unwrap();
     }

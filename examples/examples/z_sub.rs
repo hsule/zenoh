@@ -36,8 +36,16 @@ async fn main() {
             .try_to_string()
             .unwrap_or_else(|e| e.to_string().into());
 
+        // Determine if this is DATA or REALTIME based on key expression
+        let msg_type = if sample.key_expr().as_str().contains("realtime") {
+            "REALTIME"
+        } else {
+            "DATA    "
+        };
+
         print!(
-            ">> [Subscriber] Received {} ('{}': '{}')",
+            ">> [Subscriber] [{}] Received {} ('{}': '{}')",
+            msg_type,
             sample.kind(),
             sample.key_expr().as_str(),
             payload
