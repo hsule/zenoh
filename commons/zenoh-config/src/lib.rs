@@ -580,6 +580,12 @@ validated_struct::validator! {
                     /// If only one of the two endpoint nodes of a transport specifies its weight, the specified weight is applied.
                     /// If both endpoint nodes of a transport specify its weight, the greater weight is applied.
                     pub transport_weights: Vec<TransportWeight>,
+                    /// Weights of the outgoing links for data traffic in linkstate mode.
+                    /// This is used to compute a separate routing tree for data plane traffic.
+                    /// If none of the two endpoint nodes of a transport specifies its weight, a weight of 100 is applied.
+                    /// If only one of the two endpoint nodes of a transport specifies its weight, the specified weight is applied.
+                    /// If both endpoint nodes of a transport specify its weight, the greater weight is applied.
+                    pub data_transport_weights: Vec<TransportWeight>,
                 },
             },
             /// The routing strategy to use in peers and it's configuration.

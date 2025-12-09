@@ -131,10 +131,13 @@ pub(crate) struct Network {
     pub(crate) idx: NodeIndex,
     pub(crate) links: VecMap<Link>,
     pub(crate) trees: Vec<Tree>,
+    pub(crate) data_trees: Vec<Tree>,
     pub(crate) distances: Vec<f64>,
+    pub(crate) data_distances: Vec<f64>,
     pub(crate) graph: petgraph::stable_graph::StableUnGraph<Node, f64>,
     pub(crate) runtime: Runtime,
     pub(crate) link_weights: HashMap<ZenohIdProto, LinkEdgeWeight>,
+    pub(crate) data_link_weights: HashMap<ZenohIdProto, LinkEdgeWeight>,
 }
 
 impl Network {
@@ -150,6 +153,7 @@ impl Network {
         gossip_target: WhatAmIMatcher,
         autoconnect: AutoConnect,
         link_weights: HashMap<ZenohIdProto, LinkEdgeWeight>,
+        data_link_weights: HashMap<ZenohIdProto, LinkEdgeWeight>,
     ) -> Self {
         let mut graph = petgraph::stable_graph::StableGraph::default();
         tracing::debug!("{} Add node (self) {}", name, zid);
@@ -176,10 +180,17 @@ impl Network {
                 children: vec![],
                 directions: vec![None],
             }],
+            data_trees: vec![Tree {
+                parent: None,
+                children: vec![],
+                directions: vec![None],
+            }],
             distances: vec![0.0],
+            data_distances: vec![0.0],
             graph,
             runtime,
             link_weights,
+            data_link_weights,
         }
     }
 
@@ -241,6 +252,23 @@ impl Network {
             |_link| true,
         );
         true
+    }
+
+    pub(crate) fn update_data_link_weights(
+        &mut self,
+        data_link_weights: HashMap<ZenohIdProto, LinkEdgeWeight>,
+    ) -> bool {
+        let old_weights = self.data_link_weights.clone();
+        self.data_link_weights = data_link_weights;
+
+        tracing::info!(
+            "{} Update data link weights to {:?}",
+            &self.name,
+            &self.data_link_weights
+        );
+
+        // Return true if weights changed, indicating trees need recomputation
+        old_weights != self.data_link_weights
     }
 
     pub(crate) fn dot(&self) -> String {
@@ -1107,6 +1135,146 @@ impl Network {
                     .collect()
             } else {
                 self.trees[i].children.clone()
+            };
+        }
+
+        new_children
+    }
+
+    pub(crate) fn compute_data_trees(&mut self) -> Vec<Vec<NodeIndex>> {
+        let indexes = self.graph.node_indices().collect::<Vec<NodeIndex>>();
+        let max_idx = indexes.iter().max().unwrap();
+
+        let old_children: Vec<Vec<NodeIndex>> =
+            self.data_trees.iter().map(|t| t.children.clone()).collect();
+
+        self.data_trees.clear();
+        self.data_trees.resize_with(max_idx.index() + 1, || Tree {
+            parent: None,
+            children: vec![],
+            directions: vec![],
+        });
+
+        // Create a temporary graph with data_link_weights for computation
+        let mut data_graph = self.graph.clone();
+
+        // Update edges in the temporary graph using data_link_weights
+        for idx1 in &indexes {
+            for idx2 in &indexes {
+                if idx1 < idx2 && self.graph.contains_edge(*idx1, *idx2) {
+                    use std::hash::Hasher;
+                    let mut hasher = std::collections::hash_map::DefaultHasher::default();
+                    let zid1 = data_graph[*idx1].zid;
+                    let zid2 = data_graph[*idx2].zid;
+                    if zid1 > zid2 {
+                        hasher.write(&data_graph[*idx2].zid.to_le_bytes());
+                        hasher.write(&data_graph[*idx1].zid.to_le_bytes());
+                    } else {
+                        hasher.write(&data_graph[*idx1].zid.to_le_bytes());
+                        hasher.write(&data_graph[*idx2].zid.to_le_bytes());
+                    }
+
+                    // Use data_link_weights instead of link_weights
+                    let w1 = self.data_link_weights
+                        .get(&zid2)
+                        .and_then(|weight| weight.is_set().then_some(weight.value()));
+                    let w2 = self.data_link_weights
+                        .get(&zid1)
+                        .and_then(|weight| weight.is_set().then_some(weight.value()));
+                    let w = match (w1, w2) {
+                        (None, None) => LinkEdgeWeight::default().value(),
+                        (None, Some(w2)) => w2,
+                        (Some(w1), None) => w1,
+                        (Some(w1), Some(w2)) => w1.max(w2),
+                    };
+                    let weight =
+                        w as f64 * (1.0 + 0.01 * (((hasher.finish() as u32) as f64) / u32::MAX as f64));
+                    data_graph.update_edge(*idx1, *idx2, weight);
+                }
+            }
+        }
+
+        for tree_root_idx in &indexes {
+            let paths = petgraph::algo::bellman_ford(&data_graph, *tree_root_idx).unwrap();
+
+            if tree_root_idx.index() == 0 {
+                self.data_distances = paths.distances;
+            }
+
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let ps: Vec<Option<String>> = paths
+                    .predecessors
+                    .iter()
+                    .enumerate()
+                    .map(|(is, o)| {
+                        o.map(|ip| {
+                            format!(
+                                "{} <- {}",
+                                data_graph[ip].zid,
+                                data_graph[NodeIndex::new(is)].zid
+                            )
+                        })
+                    })
+                    .collect();
+                tracing::debug!("Data Tree {} {:?}", data_graph[*tree_root_idx].zid, ps);
+            }
+
+            self.data_trees[tree_root_idx.index()].parent = paths.predecessors[self.idx.index()];
+
+            for idx in &indexes {
+                if let Some(parent_idx) = paths.predecessors[idx.index()] {
+                    if parent_idx == self.idx {
+                        self.data_trees[tree_root_idx.index()].children.push(*idx);
+                    }
+                }
+            }
+
+            self.data_trees[tree_root_idx.index()]
+                .directions
+                .resize_with(max_idx.index() + 1, || None);
+            let mut dfs = petgraph::algo::DfsSpace::new(&data_graph);
+            for destination in &indexes {
+                if self.idx != *destination
+                    && petgraph::algo::has_path_connecting(
+                        &data_graph,
+                        self.idx,
+                        *destination,
+                        Some(&mut dfs),
+                    )
+                {
+                    let mut direction = None;
+                    let mut current = *destination;
+                    while let Some(parent) = paths.predecessors[current.index()] {
+                        if parent == self.idx {
+                            direction = Some(current);
+                            break;
+                        } else {
+                            current = parent;
+                        }
+                    }
+
+                    self.data_trees[tree_root_idx.index()].directions[destination.index()] =
+                        match direction {
+                            Some(direction) => Some(direction),
+                            None => self.data_trees[tree_root_idx.index()].parent,
+                        };
+                }
+            }
+        }
+
+        let mut new_children = Vec::with_capacity(self.data_trees.len());
+        new_children.resize(self.data_trees.len(), vec![]);
+
+        for i in 0..new_children.len() {
+            new_children[i] = if i < old_children.len() {
+                self.data_trees[i]
+                    .children
+                    .iter()
+                    .filter(|idx| !old_children[i].contains(idx))
+                    .cloned()
+                    .collect()
+            } else {
+                self.data_trees[i].children.clone()
             };
         }
 

@@ -211,6 +211,12 @@ impl HatBaseTrait for HatCode {
             .linkstate()
             .transport_weights()
             .clone();
+        let peer_data_link_weights = config
+            .routing()
+            .peer()
+            .linkstate()
+            .data_transport_weights()
+            .clone();
         drop(config_guard);
 
         hat_mut!(tables).linkstatepeers_net = Some(Network::new(
@@ -224,6 +230,7 @@ impl HatBaseTrait for HatCode {
             gossip_target,
             autoconnect,
             link_weights_from_config(peer_link_weights, PEERS_NET_NAME)?,
+            link_weights_from_config(peer_data_link_weights, PEERS_NET_NAME)?,
         ));
         Ok(())
     }

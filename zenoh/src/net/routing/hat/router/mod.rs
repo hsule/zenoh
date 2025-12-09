@@ -151,6 +151,20 @@ impl TreesComputationWorker {
                             .compute_trees(),
                     };
 
+                    tracing::trace!("Compute data trees");
+                    let _new_data_children = match net_type {
+                        WhatAmI::Router => hat_mut!(tables)
+                            .routers_net
+                            .as_mut()
+                            .unwrap()
+                            .compute_data_trees(),
+                        _ => hat_mut!(tables)
+                            .linkstatepeers_net
+                            .as_mut()
+                            .unwrap()
+                            .compute_data_trees(),
+                    };
+
                     tracing::trace!("Compute routes");
                     pubsub::pubsub_tree_change(&mut tables, &new_children, net_type);
                     queries::queries_tree_change(&mut tables, &new_children, net_type);
@@ -345,11 +359,23 @@ impl HatBaseTrait for HatCode {
             .linkstate()
             .transport_weights()
             .clone();
+        let router_data_link_weights = config
+            .routing()
+            .router()
+            .linkstate()
+            .data_transport_weights()
+            .clone();
         let peer_link_weights = config
             .routing()
             .peer()
             .linkstate()
             .transport_weights()
+            .clone();
+        let peer_data_link_weights = config
+            .routing()
+            .peer()
+            .linkstate()
+            .data_transport_weights()
             .clone();
         drop(config_guard);
 
@@ -365,6 +391,7 @@ impl HatBaseTrait for HatCode {
                 gossip_target,
                 autoconnect,
                 link_weights_from_config(router_link_weights, ROUTERS_NET_NAME)?,
+                link_weights_from_config(router_data_link_weights, ROUTERS_NET_NAME)?,
             ));
         }
         if peer_full_linkstate | gossip {
@@ -379,6 +406,7 @@ impl HatBaseTrait for HatCode {
                 gossip_target,
                 autoconnect,
                 link_weights_from_config(peer_link_weights, PEERS_NET_NAME)?,
+                link_weights_from_config(peer_data_link_weights, PEERS_NET_NAME)?,
             ));
         }
         if router_full_linkstate && peer_full_linkstate {
