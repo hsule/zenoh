@@ -82,6 +82,8 @@ pub struct Tables {
     pub(crate) hat: Box<dyn Any + Send + Sync>,
     pub(crate) routes_version: RoutesVersion,
     pub(crate) next_interceptor_version: AtomicUsize,
+    // Flow table: maps topic key expression to list of output faces
+    pub(crate) flow_table: HashMap<String, Vec<usize>>,
 }
 
 impl Tables {
@@ -117,6 +119,7 @@ impl Tables {
             hat: hat_code.new_tables(router_peers_failover_brokering),
             routes_version: 0,
             next_interceptor_version: AtomicUsize::new(0),
+            flow_table: HashMap::new(),
         })
     }
 

@@ -54,6 +54,20 @@ impl TransportUnicastUniversal {
                 }
             }
         }
+        // Log before calling handle_message
+        let topic_info = if let zenoh_protocol::network::NetworkBody::Push(ref push_msg) = msg.body {
+            format!(", topic_scope={}, topic_suffix='{}'",
+                push_msg.wire_expr.scope,
+                push_msg.wire_expr.suffix.as_ref())
+        } else {
+            String::new()
+        };
+        println!(
+            "Transport RX calling callback.handle_message: msg_type={:?}{}",
+            std::mem::discriminant(&msg.body),
+            topic_info
+        );
+
         callback.handle_message(msg.as_mut())
     }
 

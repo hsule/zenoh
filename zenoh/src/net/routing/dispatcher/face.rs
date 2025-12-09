@@ -463,6 +463,21 @@ impl Primitives for Face {
 
     #[inline]
     fn send_push(&self, msg: &mut Push, reliability: Reliability) {
+        // Try to resolve the full topic name
+        let tables = zenoh_core::zread!(self.tables.tables);
+        let full_topic = tables
+            .get_mapping(&self.state, &msg.wire_expr.scope, msg.wire_expr.mapping)
+            .map(|prefix| format!("{}{}", prefix.expr(), msg.wire_expr.suffix.as_ref()))
+            .unwrap_or_else(|| format!("<unknown scope {}>", msg.wire_expr.scope));
+        drop(tables);
+
+        println!(
+            "Face::send_push called: face={}, topic='{}', wire_expr.scope={}, wire_expr.suffix='{}'",
+            self.state,
+            full_topic,
+            msg.wire_expr.scope,
+            msg.wire_expr.suffix.as_ref()
+        );
         route_data(&self.tables, &self.state, msg, reliability);
     }
 

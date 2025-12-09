@@ -437,6 +437,21 @@ pub(super) struct RuntimeSession {
 
 impl TransportPeerEventHandler for RuntimeSession {
     fn handle_message(&self, msg: NetworkMessageMut) -> ZResult<()> {
+        // Get topic info for logging if this is a Push message
+        let topic_info = if let zenoh_protocol::network::NetworkBodyMut::Push(ref push_msg) = msg.body {
+            format!(", topic_scope={}, topic_suffix='{}'",
+                push_msg.wire_expr.scope,
+                push_msg.wire_expr.suffix.as_ref())
+        } else {
+            String::new()
+        };
+
+        println!(
+            "RuntimeSession::handle_message called: msg_type={:?}{}",
+            std::mem::discriminant(&msg.body),
+            topic_info
+        );
+
         self.main_handler.handle_message(msg)
     }
 

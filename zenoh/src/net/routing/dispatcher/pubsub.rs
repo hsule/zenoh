@@ -209,7 +209,6 @@ macro_rules! treat_timestamp {
     }
 }
 
-//TODOOOO
 #[inline]
 fn get_data_route(
     hat_code: &(dyn HatTrait + Send + Sync),
@@ -281,6 +280,7 @@ macro_rules! inc_stats {
     };
 }
 
+//TODOOO
 pub fn route_data(
     tables_ref: &Arc<TablesLock>,
     face: &FaceState,
@@ -288,6 +288,39 @@ pub fn route_data(
     reliability: Reliability,
 ) {
     let tables = zread!(tables_ref.tables);
+
+    // Try to resolve the full topic name for logging
+    let mapping_result = tables.get_mapping(face, &msg.wire_expr.scope, msg.wire_expr.mapping);
+    let full_topic = mapping_result
+        .map(|prefix| format!("{}{}", prefix.expr(), msg.wire_expr.suffix.as_ref()))
+        .unwrap_or_else(|| format!("<unknown scope {}>", msg.wire_expr.scope));
+
+    println!(
+        "route_data called: face={}, topic='{}', scope={}, suffix='{}', mapping={:?}, mapping_found={}",
+        face,
+        full_topic,
+        msg.wire_expr.scope,
+        msg.wire_expr.suffix.as_ref(),
+        msg.wire_expr.mapping,
+        mapping_result.is_some()
+    );
+
+    if let Some(prefix) = mapping_result {
+        println!(
+            "Scope {} resolved to prefix='{}', full_topic='{}{}'",
+            msg.wire_expr.scope,
+            prefix.expr(),
+            prefix.expr(),
+            msg.wire_expr.suffix.as_ref()
+        );
+    } else {
+        println!(
+            "WARNING: Scope {} NOT FOUND in mapping table for face {}!",
+            msg.wire_expr.scope,
+            face
+        );
+    }
+
     match tables
         .get_mapping(face, &msg.wire_expr.scope, msg.wire_expr.mapping)
         .cloned()
@@ -309,54 +342,49 @@ pub fn route_data(
             } else {
                 inc_stats!(face, rx, admin, msg.payload);
             }
+            println!(
+                        "Routing for key '{}'",
+                        expr.full_expr().to_string(),
+                    );
 
             if tables_ref.hat_code.ingress_filter(&tables, face, &mut expr) {
-                let res = Resource::get_resource(&prefix, expr.suffix);
+                let key_expr_str = expr.full_expr().to_string();
 
-                let route = get_data_route(
-                    tables_ref.hat_code.as_ref(),
-                    &tables,
-                    face,
-                    &res,
-                    &mut expr,
-                    msg.ext_nodeid.node_id,
+                println!(
+                    "After ingress_filter: key_expr='{}'",
+                    key_expr_str
                 );
 
-                if !route.is_empty() {
+                // Check flow table first
+                let flow_table_hit = tables.flow_table.get(&key_expr_str).cloned();
+
+                println!(
+                    "Flow table lookup for key '{}': {}",
+                    key_expr_str,
+                    if flow_table_hit.is_some() { "HIT" } else { "MISS" }
+                );
+
+                let res = Resource::get_resource(&prefix, expr.suffix);
+
+                // Try to use flow table first if available
+                if let Some(cached_face_ids) = flow_table_hit {
+                    println!(
+                        "Flow table HIT for key '{}': cached faces {:?}",
+                        key_expr_str,
+                        cached_face_ids
+                    );
+
                     treat_timestamp!(&tables.hlc, msg.payload, tables.drop_future_timestamp);
 
-                    if route.len() == 1 {
-                        let (outface, key_expr, context) = route.iter().next().unwrap();
-                        if tables_ref
-                            .hat_code
-                            .egress_filter(&tables, face, outface, &mut expr)
-                        {
-                            drop(tables);
-                            #[cfg(feature = "stats")]
-                            if !admin {
-                                inc_stats!(outface, tx, user, msg.payload);
-                            } else {
-                                inc_stats!(outface, tx, admin, msg.payload);
-                            }
-                            msg.wire_expr = key_expr.into();
-                            msg.ext_nodeid = ext::NodeIdType { node_id: *context };
-                            outface.primitives.send_push(msg, reliability);
-                            // Reset the wire_expr to indicate the message has been consumed
-                            msg.wire_expr = WireExpr::empty();
-                        }
-                    } else {
-                        let route = route
-                            .iter()
-                            .filter(|(outface, _key_expr, _context)| {
-                                tables_ref
-                                    .hat_code
-                                    .egress_filter(&tables, face, outface, &mut expr)
-                            })
-                            .cloned()
-                            .collect::<Vec<Direction>>();
-
-                        drop(tables);
-                        for (outface, key_expr, context) in route {
+                    // Use cached faces from flow table
+                    for face_id in cached_face_ids {
+                        if let Some(outface) = tables.faces.get(&face_id) {
+                            println!(
+                                "Flow table route: {} -> {} (key: {})",
+                                face,
+                                outface,
+                                key_expr_str
+                            );
                             #[cfg(feature = "stats")]
                             if !admin {
                                 inc_stats!(outface, tx, user, msg.payload)
@@ -364,22 +392,135 @@ pub fn route_data(
                                 inc_stats!(outface, tx, admin, msg.payload)
                             }
 
-                            outface.primitives.send_push(
+                            let cloned_outface = outface.clone();
+                            drop(tables);
+                            cloned_outface.primitives.send_push(
                                 &mut Push {
-                                    wire_expr: key_expr,
+                                    wire_expr: msg.wire_expr.clone(),
                                     ext_qos: msg.ext_qos,
                                     ext_tstamp: None,
-                                    ext_nodeid: ext::NodeIdType { node_id: context },
+                                    ext_nodeid: msg.ext_nodeid,
                                     payload: msg.payload.clone(),
                                 },
                                 reliability,
-                            )
+                            );
+                            return;
                         }
+                    }
+                    drop(tables);
+                } else {
+                    // Flow table MISS - compute route normally and update flow table
+                    println!("Flow table MISS for key '{}'", key_expr_str);
+
+                    let route = get_data_route(
+                        tables_ref.hat_code.as_ref(),
+                        &tables,
+                        face,
+                        &res,
+                        &mut expr,
+                        msg.ext_nodeid.node_id,
+                    );
+
+                    if !route.is_empty() {
+                        treat_timestamp!(&tables.hlc, msg.payload, tables.drop_future_timestamp);
+
+                        // Collect face IDs for flow table
+                        let mut face_ids_for_flow_table = Vec::new();
+
+                        if route.len() == 1 {
+                            let (outface, key_expr, context) = route.iter().next().unwrap();
+                            if tables_ref
+                                .hat_code
+                                .egress_filter(&tables, face, outface, &mut expr)
+                            {
+                                face_ids_for_flow_table.push(outface.id);
+
+                                drop(tables);
+
+                                // Update flow table
+                                let mut wtables = zwrite!(tables_ref.tables);
+                                wtables.flow_table.insert(key_expr_str.clone(), face_ids_for_flow_table);
+                                drop(wtables);
+
+                                println!(
+                                    "Route data from {} to outface: {} (key: {})",
+                                    face,
+                                    outface,
+                                    key_expr_str
+                                );
+                                #[cfg(feature = "stats")]
+                                if !admin {
+                                    inc_stats!(outface, tx, user, msg.payload);
+                                } else {
+                                    inc_stats!(outface, tx, admin, msg.payload);
+                                }
+                                msg.wire_expr = key_expr.into();
+                                msg.ext_nodeid = ext::NodeIdType { node_id: *context };
+                                outface.primitives.send_push(msg, reliability);
+                                // Reset the wire_expr to indicate the message has been consumed
+                                msg.wire_expr = WireExpr::empty();
+                            }
+                        } else {
+                            let route = route
+                                .iter()
+                                .filter(|(outface, _key_expr, _context)| {
+                                    tables_ref
+                                        .hat_code
+                                        .egress_filter(&tables, face, outface, &mut expr)
+                                })
+                                .cloned()
+                                .collect::<Vec<Direction>>();
+
+                            for (outface, _, _) in &route {
+                                face_ids_for_flow_table.push(outface.id);
+                            }
+
+                            drop(tables);
+
+                            // Update flow table
+                            let mut wtables = zwrite!(tables_ref.tables);
+                            wtables.flow_table.insert(key_expr_str.clone(), face_ids_for_flow_table);
+                            drop(wtables);
+
+                            for (outface, key_expr, context) in route {
+                                println!(
+                                    "Route data from {} to outface: {} (key: {})",
+                                    face,
+                                    outface,
+                                    key_expr_str
+                                );
+                                #[cfg(feature = "stats")]
+                                if !admin {
+                                    inc_stats!(outface, tx, user, msg.payload)
+                                } else {
+                                    inc_stats!(outface, tx, admin, msg.payload)
+                                }
+
+                                outface.primitives.send_push(
+                                    &mut Push {
+                                        wire_expr: key_expr,
+                                        ext_qos: msg.ext_qos,
+                                        ext_tstamp: None,
+                                        ext_nodeid: ext::NodeIdType { node_id: context },
+                                        payload: msg.payload.clone(),
+                                    },
+                                    reliability,
+                                )
+                            }
+                        }
+                    } else {
+                        drop(tables);
                     }
                 }
             }
         }
         None => {
+            println!(
+                "get_mapping returned None: face={}, scope={}, mapping={:?}",
+                face,
+                msg.wire_expr.scope,
+                msg.wire_expr.mapping
+            );
             tracing::error!(
                 "{} Route data with unknown scope {}!",
                 face,

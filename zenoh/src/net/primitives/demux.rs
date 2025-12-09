@@ -105,7 +105,34 @@ impl InterceptorContext for DeMuxContext<'_> {
 impl TransportPeerEventHandler for DeMux {
     #[inline]
     fn handle_message(&self, mut msg: NetworkMessageMut) -> ZResult<()> {
+        // Try to get topic info if this is a Push message
+        let topic_info = if let NetworkBodyMut::Push(ref push_msg) = msg.body {
+            let tables = zenoh_core::zread!(self.face.tables.tables);
+            let topic = tables
+                .get_mapping(&self.face.state, &push_msg.wire_expr.scope, push_msg.wire_expr.mapping)
+                .map(|prefix| format!("{}{}", prefix.expr(), push_msg.wire_expr.suffix.as_ref()))
+                .unwrap_or_else(|| format!("<unknown scope {}>", push_msg.wire_expr.scope));
+            drop(tables);
+            format!(", topic='{}'", topic)
+        } else {
+            String::new()
+        };
+
+        println!(
+            "DeMux::handle_message: face={}, msg_type={:?}{}",
+            self.face.state,
+            std::mem::discriminant(&msg.body),
+            topic_info
+        );
+
         let interceptor = self.interceptor.load();
+        println!(
+            "Interceptors count: {}, is_empty: {}{}",
+            interceptor.interceptors.len(),
+            interceptor.interceptors.is_empty(),
+            topic_info
+        );
+
         if !interceptor.interceptors.is_empty() {
             let mut ctx = DeMuxContext {
                 demux: self,
@@ -146,7 +173,34 @@ impl TransportPeerEventHandler for DeMux {
                     }
                 }
                 _ => {
-                    if !interceptor.intercept(&mut msg, &mut ctx as &mut dyn InterceptorContext) {
+                    let intercepted = interceptor.intercept(&mut msg, &mut ctx as &mut dyn InterceptorContext);
+
+                    // Get topic info for logging
+                    let topic_info = if let NetworkBodyMut::Push(ref push_msg) = msg.body {
+                        let tables = zenoh_core::zread!(self.face.tables.tables);
+                        let topic = tables
+                            .get_mapping(&self.face.state, &push_msg.wire_expr.scope, push_msg.wire_expr.mapping)
+                            .map(|prefix| format!("{}{}", prefix.expr(), push_msg.wire_expr.suffix.as_ref()))
+                            .unwrap_or_else(|| format!("<unknown scope {}>", push_msg.wire_expr.scope));
+                        drop(tables);
+                        format!(", topic='{}'", topic)
+                    } else {
+                        String::new()
+                    };
+
+                    println!(
+                        "Interceptor result for msg type {:?}: intercepted={}{}",
+                        std::mem::discriminant(&msg.body),
+                        intercepted,
+                        topic_info
+                    );
+                    if !intercepted {
+                        println!(
+                            "Message BLOCKED by interceptor: face={}, msg type={:?}{}",
+                            self.face.state,
+                            std::mem::discriminant(&msg.body),
+                            topic_info
+                        );
                         return Ok(());
                     }
                 }
@@ -154,7 +208,25 @@ impl TransportPeerEventHandler for DeMux {
         }
 
         match msg.body {
-            NetworkBodyMut::Push(m) => self.face.send_push(m, msg.reliability),
+            NetworkBodyMut::Push(m) => {
+                // Try to resolve the full topic name
+                let tables = zenoh_core::zread!(self.face.tables.tables);
+                let full_topic = tables
+                    .get_mapping(&self.face.state, &m.wire_expr.scope, m.wire_expr.mapping)
+                    .map(|prefix| format!("{}{}", prefix.expr(), m.wire_expr.suffix.as_ref()))
+                    .unwrap_or_else(|| format!("<unknown scope {}>", m.wire_expr.scope));
+                drop(tables);
+
+                println!(
+                    "Demux calling send_push: face={}, topic='{}', wire_expr.scope={}, wire_expr.suffix='{}', mapping={:?}",
+                    self.face.state,
+                    full_topic,
+                    m.wire_expr.scope,
+                    m.wire_expr.suffix.as_ref(),
+                    m.wire_expr.mapping
+                );
+                self.face.send_push(m, msg.reliability)
+            }
             NetworkBodyMut::Declare(m) => self.face.send_declare(m),
             NetworkBodyMut::Interest(m) => self.face.send_interest(m),
             NetworkBodyMut::Request(m) => self.face.send_request(m),

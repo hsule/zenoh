@@ -896,6 +896,17 @@ pub(crate) fn register_expr(
 
                 get_mut_unchecked(ctx).remote_expr_id = Some(expr_id);
 
+                // Log the mapping registration
+                let full_key = res.expr().to_string();
+                println!(
+                    "REGISTER_EXPR: face={}, expr_id={}, prefix='{}', suffix='{}', full_key='{}'",
+                    face,
+                    expr_id,
+                    prefix.expr(),
+                    expr.suffix.as_ref(),
+                    full_key
+                );
+
                 get_mut_unchecked(face)
                     .remote_mappings
                     .insert(expr_id, res.clone());
