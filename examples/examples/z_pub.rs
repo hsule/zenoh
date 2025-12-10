@@ -38,6 +38,9 @@ async fn main() {
         .await
         .unwrap();
 
+    println!("Declaring Publisher on 'demo/example/zenoh-rs-pub2' with DATA priority...");
+    let publisher2 = session.declare_publisher("demo/example/zenoh-rs-pub2").await.unwrap();
+
     if add_matching_listener {
         publisher
             .matching_listener()
@@ -77,8 +80,10 @@ async fn main() {
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     println!("Press CTRL-C to quit...");
+    let start_time = std::time::Instant::now();
     for idx in 0..u32::MAX {
         tokio::time::sleep(Duration::from_millis(PERIOD_MS)).await;
+        let elapsed = start_time.elapsed();
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let now_ns = (now.as_secs() as u128) * 1_000_000_000 + now.subsec_nanos() as u128;
@@ -110,12 +115,28 @@ async fn main() {
             .attachment(attachment.clone())
             .await
             .unwrap();
+
+        // After 60 seconds, also publish to demo/example/zenoh-rs-pub2
+        if elapsed >= Duration::from_secs(60) {
+            let prefix_pub2 = format!("[{:4}] ts_ns={} ", idx, now_ns);
+            let payload_len_pub2 = bytes_per_interval.saturating_sub(prefix_pub2.len());
+            let payload_pub2: String = std::iter::repeat('B').take(payload_len_pub2).collect();
+            let buf_pub2 = prefix_pub2 + &payload_pub2;
+
+            println!("Putting DATA2 ('demo/example/zenoh-rs-pub2': '{}')...", buf_pub2);
+            publisher2
+                .put(buf_pub2)
+                .encoding(Encoding::TEXT_PLAIN)
+                .attachment(attachment.clone())
+                .await
+                .unwrap();
+        }
     }
 }
 
 #[derive(clap::Parser, Clone, PartialEq, Eq, Hash, Debug)]
 struct Args {
-    #[arg(short, long, default_value = "demo/example/zenoh-rs-pub")]
+    #[arg(short, long, default_value = "demo/example/zenoh-rs-pub1")]
     /// The key expression to write to.
     key: KeyExpr<'static>,
     #[arg(short, long, default_value = "Pub from Rust!")]
