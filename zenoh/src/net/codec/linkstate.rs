@@ -55,6 +55,9 @@ where
         if x.data_link_weights.is_some() {
             options |= linkstate::DWGT;
         }
+        if x.active_flows.is_some() {
+            options |= linkstate::FLOWS;
+        }
         codec.write(&mut *writer, options)?;
 
         // Body
@@ -84,6 +87,12 @@ where
             // do not write len since it is the same as that of links
             for w in data_link_weights.iter() {
                 codec.write(&mut *writer, w)?;
+            }
+        }
+        if let Some(active_flows) = x.active_flows.as_ref() {
+            codec.write(&mut *writer, active_flows.len())?;
+            for flow in active_flows.iter() {
+                codec.write(&mut *writer, flow.key_expr.as_str())?;
             }
         }
 
@@ -151,6 +160,19 @@ where
             None
         };
 
+        let active_flows = if imsg::has_option(options, linkstate::FLOWS) {
+            use crate::net::protocol::linkstate::FlowPin;
+            let flows_len: usize = codec.read(&mut *reader)?;
+            let mut flows: Vec<FlowPin> = Vec::with_capacity(flows_len);
+            for _ in 0..flows_len {
+                let key_expr: String = codec.read(&mut *reader)?;
+                flows.push(FlowPin { key_expr });
+            }
+            Some(flows)
+        } else {
+            None
+        };
+
         Ok(LinkState {
             psid,
             sn,
@@ -160,6 +182,7 @@ where
             links,
             link_weights,
             data_link_weights,
+            active_flows,
         })
     }
 }

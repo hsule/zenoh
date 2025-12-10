@@ -216,6 +216,7 @@ impl Network {
             links,
             link_weights: None,
             data_link_weights: None,
+            active_flows: None,
         }
     }
 

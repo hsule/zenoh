@@ -954,10 +954,24 @@ impl HatBaseTrait for HatCode {
         Ok(())
     }
 
+    fn record_flow(
+        &self,
+        tables: &Tables,
+        key_expr: String,
+        previous_hop: ZenohIdProto,
+        next_hop: ZenohIdProto,
+        priority: zenoh_protocol::core::Priority,
+    ) {
+        // Record flow in routers network
+        if let Some(net) = &hat!(tables).routers_net {
+            net.record_flow(key_expr, previous_hop, next_hop, priority);
+        }
+    }
+
     fn links_info(
         &self,
         tables: &Tables,
-    ) -> HashMap<ZenohIdProto, crate::net::protocol::linkstate::LinkInfo> {
+        ) -> HashMap<ZenohIdProto, crate::net::protocol::linkstate::LinkInfo> {
         let mut out = HashMap::new();
         if let Some(net) = &hat!(tables).routers_net {
             out.extend(net.links_info());

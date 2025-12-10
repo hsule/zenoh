@@ -121,6 +121,76 @@ pub(crate) struct Tree {
     pub(crate) directions: Vec<Option<NodeIndex>>,
 }
 
+/// Flow identifier: (key_expression, source_peer_id)
+// Flow ID is just the key_expr - simpler, assumes one publisher per topic
+pub(crate) type FlowId = String;
+
+/// Information about a flow's current routing
+#[derive(Debug, Clone)]
+pub(crate) struct FlowInfo {
+    pub key_expr: String,
+    pub previous_hop: ZenohIdProto,  // Where the data came from (upstream neighbor)
+    pub next_hop: ZenohIdProto,
+    pub priority: zenoh_protocol::core::Priority,
+    pub last_update: std::time::Instant,
+    pub packet_count: u64,
+}
+
+/// Flow table for tracking active flows and their routes
+pub(crate) struct FlowTable {
+    flows: HashMap<FlowId, FlowInfo>,
+}
+
+impl FlowTable {
+    pub fn new() -> Self {
+        FlowTable {
+            flows: HashMap::new(),
+        }
+    }
+
+    pub fn update_flow(&mut self, key_expr: String, previous_hop: ZenohIdProto, next_hop: ZenohIdProto, priority: zenoh_protocol::core::Priority) {
+        let flow_id = key_expr.clone();
+        self.flows
+            .entry(flow_id)
+            .and_modify(|info| {
+                info.previous_hop = previous_hop;
+                info.next_hop = next_hop;
+                info.priority = priority;
+                info.last_update = std::time::Instant::now();
+                info.packet_count += 1;
+            })
+            .or_insert(FlowInfo {
+                key_expr,
+                previous_hop,
+                next_hop,
+                priority,
+                last_update: std::time::Instant::now(),
+                packet_count: 1,
+            });
+    }
+
+    pub fn get_flows_using_link(&self, link: &ZenohIdProto) -> Vec<FlowId> {
+        self.flows
+            .iter()
+            .filter(|(_, info)| &info.next_hop == link)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    pub fn remove_flow(&mut self, flow_id: &FlowId) {
+        self.flows.remove(flow_id);
+    }
+
+    pub fn get_flow(&self, flow_id: &FlowId) -> Option<&FlowInfo> {
+        self.flows.get(flow_id)
+    }
+
+    pub fn clear_old_flows(&mut self, timeout: std::time::Duration) {
+        let now = std::time::Instant::now();
+        self.flows.retain(|_, info| now.duration_since(info.last_update) < timeout);
+    }
+}
+
 pub(crate) struct Network {
     pub(crate) name: String,
     pub(crate) full_linkstate: bool,
@@ -139,6 +209,8 @@ pub(crate) struct Network {
     pub(crate) runtime: Runtime,
     pub(crate) link_weights: HashMap<ZenohIdProto, LinkEdgeWeight>,
     pub(crate) data_link_weights: HashMap<ZenohIdProto, LinkEdgeWeight>,
+    pub(crate) flow_table: std::sync::RwLock<FlowTable>,
+    pub(crate) pinned_flows: std::sync::RwLock<HashMap<FlowId, ZenohIdProto>>,
 }
 
 impl Network {
@@ -193,6 +265,8 @@ impl Network {
             runtime,
             link_weights,
             data_link_weights,
+            flow_table: std::sync::RwLock::new(FlowTable::new()),
+            pinned_flows: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -261,6 +335,24 @@ impl Network {
         data_link_weights: HashMap<ZenohIdProto, LinkEdgeWeight>,
     ) -> bool {
         let old_weights = self.graph[self.idx].data_links.clone();
+
+        // Log flows using congested links before migration
+        for (dest_zid, weight) in &data_link_weights {
+            if weight.is_set() && weight.value() > 1000 {
+                let flow_table = self.flow_table.read().unwrap();
+                let flows = flow_table.get_flows_using_link(dest_zid);
+                if !flows.is_empty() {
+                    tracing::info!(
+                        "{} Congestion detected on link to {}. {} flows using this link: {:?}",
+                        &self.name,
+                        dest_zid,
+                        flows.len(),
+                        flows
+                    );
+                }
+            }
+        }
+
         self.graph[self.idx].data_links = data_link_weights.clone();
         self.data_link_weights = data_link_weights;
 
@@ -293,6 +385,94 @@ impl Network {
 
         // Return true indicating trees need recomputation
         true
+    }
+
+    /// Record a flow's routing decision
+    pub(crate) fn record_flow(&self, key_expr: String, previous_hop: ZenohIdProto, next_hop: ZenohIdProto, priority: zenoh_protocol::core::Priority) {
+        tracing::trace!(
+            "{} Record flow: key_expr={}, previous_hop={}, next_hop={}, priority={:?}",
+            &self.name,
+            key_expr,
+            previous_hop,
+            next_hop,
+            priority
+        );
+        self.flow_table.write().unwrap().update_flow(key_expr, previous_hop, next_hop, priority);
+    }
+
+    /// Get all flows using a specific link
+    pub(crate) fn get_flows_on_link(&self, link: &ZenohIdProto) -> Vec<FlowId> {
+        self.flow_table.read().unwrap().get_flows_using_link(link)
+    }
+
+    /// Clear old inactive flows (older than 30 seconds)
+    pub(crate) fn cleanup_old_flows(&self) {
+        self.flow_table.write().unwrap().clear_old_flows(std::time::Duration::from_secs(30));
+    }
+
+    /// Get flow information (returns cloned FlowInfo to avoid lifetime issues)
+    pub(crate) fn get_flow_info(&self, flow_id: &FlowId) -> Option<FlowInfo> {
+        self.flow_table.read().unwrap().get_flow(flow_id).cloned()
+    }
+
+    /// Process flows received from remote nodes to pin their routes and prevent oscillation
+    fn process_received_flows(&self, remote_zid: &ZenohIdProto, flows: &[crate::net::protocol::linkstate::FlowPin]) {
+        let mut pinned = self.pinned_flows.write().unwrap();
+        for flow in flows {
+            let flow_id = flow.key_expr.clone();
+            // Pin this flow to continue using the route through remote_zid
+            // This prevents complete rerouting when weights change
+            pinned.insert(flow_id.clone(), *remote_zid);
+            tracing::info!(
+                "{} Pinned flow: key_expr={}, pinned_to={}",
+                &self.name,
+                flow.key_expr,
+                remote_zid
+            );
+        }
+    }
+
+    /// Propagate received flows upstream to continue the cascade
+    /// When we receive flow pinning requests from downstream, we should propagate them upstream
+    /// to ensure the entire path pins these flows
+    fn propagate_flows_upstream(&mut self, received_flows: &[crate::net::protocol::linkstate::FlowPin]) {
+        if received_flows.is_empty() {
+            return;
+        }
+
+        tracing::trace!(
+            "{} Cascade: received {} flows, checking if need to propagate upstream",
+            &self.name,
+            received_flows.len()
+        );
+
+        // Trigger a link state update which will include flows to upstream neighbors
+        // The make_link_state function will automatically collect flows based on previous_hop
+        self.graph[self.idx].sn += 1;
+        self.send_on_links(
+            vec![(
+                self.idx,
+                Details {
+                    zid: false,
+                    links: true,  // Send link state update which will include active flows
+                    ..Default::default()
+                },
+            )],
+            |_link| true,
+        );
+    }
+
+    /// Check if a flow is pinned to a specific next hop
+    pub(crate) fn is_flow_pinned(&self, flow_id: &FlowId, next_hop: &ZenohIdProto) -> bool {
+        self.pinned_flows.read().unwrap()
+            .get(flow_id)
+            .map(|pinned_to| pinned_to == next_hop)
+            .unwrap_or(false)
+    }
+
+    /// Get the pinned next hop for a flow, if it exists
+    pub(crate) fn get_pinned_next_hop(&self, flow_id: &FlowId) -> Option<ZenohIdProto> {
+        self.pinned_flows.read().unwrap().get(flow_id).copied()
     }
 
     pub(crate) fn dot(&self) -> String {
@@ -353,7 +533,7 @@ impl Network {
         idx
     }
 
-    fn make_link_state(&self, idx: NodeIndex, details: &Details) -> LinkState {
+    fn make_link_state(&self, idx: NodeIndex, details: &Details, target_neighbor: Option<&ZenohIdProto>) -> LinkState {
         let mut weights = vec![];
         let mut data_weights = vec![];
         let mut links = vec![];
@@ -387,6 +567,59 @@ impl Network {
                 }
             }
         }
+
+        // Collect active flows for REVERSE propagation (upstream direction)
+        // Tell the upstream neighbor (where data came from) to pin these flows
+        // This ensures the entire upstream path stays stable when weights change
+        let active_flows = if idx == self.idx && details.links && target_neighbor.is_some() {
+            use crate::net::protocol::linkstate::FlowPin;
+            let flow_table = self.flow_table.read().unwrap();
+            let target_zid = target_neighbor.unwrap();
+
+            // Collect flows that came FROM this target_neighbor (upstream)
+            let flows: Vec<FlowPin> = flow_table.flows.iter()
+                .filter(|(key_expr, info)| {
+                    let is_data_priority = matches!(
+                        info.priority,
+                        zenoh_protocol::core::Priority::Data
+                            | zenoh_protocol::core::Priority::DataHigh
+                            | zenoh_protocol::core::Priority::DataLow
+                    );
+                    // KEY CHANGE: Check previous_hop instead of next_hop for reverse propagation
+                    let came_from_this_neighbor = &info.previous_hop == target_zid;
+
+                    if is_data_priority && came_from_this_neighbor {
+                        tracing::trace!(
+                            "{} Reverse propagation: telling UPSTREAM {} to pin flow {}",
+                            &self.name,
+                            target_zid,
+                            key_expr
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .map(|(key_expr, _)| FlowPin {
+                    key_expr: key_expr.clone(),
+                })
+                .collect();
+
+            if flows.is_empty() {
+                None
+            } else {
+                tracing::info!(
+                    "{} Sending {} flows to UPSTREAM {}",
+                    &self.name,
+                    flows.len(),
+                    target_zid
+                );
+                Some(flows)
+            }
+        } else {
+            None
+        };
+
         LinkState {
             psid: idx.index().try_into().unwrap(),
             sn: self.graph[idx].sn,
@@ -408,13 +641,14 @@ impl Network {
             links,
             link_weights: has_non_default_weight.then_some(weights),
             data_link_weights: has_non_default_data_weight.then_some(data_weights),
+            active_flows,
         }
     }
 
-    fn make_msg(&self, idxs: &Vec<(NodeIndex, Details)>) -> Result<NetworkMessage, DidntWrite> {
+    fn make_msg(&self, idxs: &Vec<(NodeIndex, Details)>, target_neighbor: Option<&ZenohIdProto>) -> Result<NetworkMessage, DidntWrite> {
         let mut link_states = vec![];
         for (idx, details) in idxs {
-            link_states.push(self.make_link_state(*idx, details));
+            link_states.push(self.make_link_state(*idx, details, target_neighbor));
         }
         let codec = Zenoh080Routing::new();
         let mut buf = ZBuf::empty();
@@ -432,7 +666,8 @@ impl Network {
         for idx in &mut idxs {
             idx.1.locators = self.propagate_locators(idx.0, transport);
         }
-        if let Ok(mut msg) = self.make_msg(&idxs) {
+        let target_zid = transport.get_zid().ok();
+        if let Ok(mut msg) = self.make_msg(&idxs, target_zid.as_ref()) {
             tracing::trace!("{} Send to {:?} {:?}", self.name, transport.get_zid(), msg);
             if let Err(e) = transport.schedule(msg.as_mut()) {
                 tracing::debug!("{} Error sending LinkStateList: {}", self.name, e);
@@ -450,7 +685,8 @@ impl Network {
             for idx in &mut idxs {
                 idx.1.locators = self.propagate_locators(idx.0, &link.transport);
             }
-            if let Ok(msg) = self.make_msg(&idxs) {
+            // Generate message specific to this link (includes only flows using this link)
+            if let Ok(msg) = self.make_msg(&idxs, Some(&link.zid)) {
                 if parameters(link) {
                     tracing::trace!("{} Send to {} {:?}", self.name, link.zid, msg);
                     if let Err(e) = link.transport.schedule(msg.clone().as_mut()) {
@@ -557,6 +793,7 @@ impl Network {
                         link_state.links,
                         link_state.link_weights,
                         link_state.data_link_weights,
+                        link_state.active_flows,
                     ))
                 } else {
                     match src_link.get_zid(&link_state.psid) {
@@ -568,6 +805,7 @@ impl Network {
                             link_state.links,
                             link_state.link_weights,
                             link_state.data_link_weights,
+                            link_state.active_flows,
                         )),
                         None => {
                             tracing::error!(
@@ -587,7 +825,7 @@ impl Network {
 
         link_states
             .into_iter()
-            .map(|(zid, whatami, locators, sn, links, weights, data_weights)| {
+            .map(|(zid, whatami, locators, sn, links, weights, data_weights, active_flows)| {
                 let mut edges = HashMap::with_capacity(links.len());
                 let mut data_edges = HashMap::with_capacity(links.len());
                 for i in 0..links.len() {
@@ -626,6 +864,7 @@ impl Network {
                     locators,
                     links: edges,
                     data_links: data_edges,
+                    active_flows,
                 }
             })
             .collect::<Vec<_>>()
@@ -646,20 +885,40 @@ impl Network {
                         data_links: ls.data_links,
                     });
                     changes.updated_nodes.push((idx, self.graph[idx].clone()));
+
+                    // Process received active flows to pin routes
+                    if let Some(flows) = &ls.active_flows {
+                        self.process_received_flows(&ls.zid, flows);
+                        // Cascade: propagate flows upstream to continue the pinning chain
+                        self.propagate_flows_upstream(flows);
+                    }
+
                     if ls.locators.is_none() {
                         continue;
                     }
                     idx
                 }
                 Some(idx) => {
-                    let node = &mut self.graph[idx];
-                    if node.sn >= ls.sn {
-                        continue;
+                    {
+                        let node = &self.graph[idx];
+                        if node.sn >= ls.sn {
+                            continue;
+                        }
                     }
+
+                    // Process received active flows to pin routes
+                    if let Some(flows) = &ls.active_flows {
+                        self.process_received_flows(&ls.zid, flows);
+                        // Cascade: propagate flows upstream to continue the pinning chain
+                        self.propagate_flows_upstream(flows);
+                    }
+
+                    let node = &mut self.graph[idx];
                     node.sn = ls.sn;
                     node.links.clone_from(&ls.links);
                     node.data_links.clone_from(&ls.data_links);
                     changes.updated_nodes.push((idx, node.clone()));
+
                     if ls.locators.is_none() || node.locators == ls.locators {
                         continue;
                     }
@@ -790,8 +1049,16 @@ impl Network {
                         node.links.clone_from(&ls.links);
                         node.data_links.clone_from(&ls.data_links);
                         if ls.locators.is_some() {
-                            node.locators = ls.locators;
+                            node.locators = ls.locators.clone();
                         }
+
+                        // Process received active flows to pin routes
+                        if let Some(flows) = &ls.active_flows {
+                            self.process_received_flows(&ls.zid, flows);
+                            // Cascade: propagate flows upstream to continue the pinning chain
+                            self.propagate_flows_upstream(flows);
+                        }
+
                         if oldsn == 0 {
                             new_nodes.push(idx);
                         } else {
@@ -807,13 +1074,21 @@ impl Network {
                     let node = Node {
                         zid: ls.zid,
                         whatami: Some(ls.whatami),
-                        locators: ls.locators,
+                        locators: ls.locators.clone(),
                         sn: ls.sn,
                         links: ls.links.clone(),
                         data_links: ls.data_links.clone(),
                     };
                     tracing::debug!("{} Add node (state) {}", self.name, ls.zid);
                     let idx = self.add_node(node);
+
+                    // Process received active flows to pin routes
+                    if let Some(flows) = &ls.active_flows {
+                        self.process_received_flows(&ls.zid, flows);
+                        // Cascade: propagate flows upstream to continue the pinning chain
+                        self.propagate_flows_upstream(flows);
+                    }
+
                     new_nodes.push(idx);
                     idx
                 }

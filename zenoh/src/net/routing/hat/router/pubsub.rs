@@ -1229,6 +1229,7 @@ impl HatPubSubTrait for HatCode {
             source: NodeId,
             subs: &HashSet<ZenohIdProto>,
             use_data_tree: bool,
+            key_expr_str: &str,
         ) {
             // Select tree based on use_data_tree flag
             let trees = if use_data_tree {
@@ -1247,15 +1248,35 @@ impl HatPubSubTrait for HatCode {
                 &net.trees
             };
 
+            // Get source ZenohIdProto for flow pinning
+            let source_zid = net.graph.node_indices()
+                .find(|idx| idx.index() == source as usize)
+                .map(|idx| net.graph[idx].zid);
+
             if trees.len() > source as usize {
                 for sub in subs {
                     if let Some(sub_idx) = net.get_idx(sub) {
                         if trees[source as usize].directions.len() > sub_idx.index() {
-                            if let Some(direction) =
-                                trees[source as usize].directions[sub_idx.index()]
-                            {
+                            // Check if this flow is pinned
+                            let flow_id = key_expr_str.to_string();
+                            let pinned_direction = net.get_pinned_next_hop(&flow_id).and_then(|pinned_next_hop| {
+                                // Just check if the pinned next_hop exists in the graph
+                                // Don't verify if it's in the tree path - pinning overrides the tree!
+                                net.get_idx(&pinned_next_hop)
+                            });
+
+                            let direction = pinned_direction
+                                .or_else(|| trees[source as usize].directions.get(sub_idx.index()).and_then(|&d| d));
+
+                            if let Some(direction) = direction {
                                 if net.graph.contains_node(direction) {
                                     if let Some(face) = tables.get_face(&net.graph[direction].zid) {
+                                        if pinned_direction.is_some() {
+                                            tracing::info!(
+                                                "Using pinned route for flow: key_expr={}, source={:?}, next_hop={}",
+                                                key_expr_str, source_zid, net.graph[direction].zid
+                                            );
+                                        }
                                         route.insert(face.id, || {
                                             let key_expr = Resource::get_best_key(
                                                 expr.prefix,
@@ -1333,6 +1354,7 @@ impl HatPubSubTrait for HatCode {
                     router_source,
                     &res_hat!(mres).router_subs,
                     use_data_tree,
+                    &key_expr.as_str(),
                 );
             }
 
@@ -1350,6 +1372,7 @@ impl HatPubSubTrait for HatCode {
                     peer_source,
                     &res_hat!(mres).linkstatepeer_subs,
                     use_data_tree,
+                    &key_expr.as_str(),
                 );
             }
 

@@ -22,10 +22,18 @@ pub const WAI: u64 = 1 << 1; // 0x02
 pub const LOC: u64 = 1 << 2; // 0x04
 pub const WGT: u64 = 1 << 3; // 0x08
 pub const DWGT: u64 = 1 << 4; // 0x10
+pub const FLOWS: u64 = 1 << 5; // 0x20
+
+/// Flow pinning information to prevent route oscillation
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+// Flow pin only needs key_expr - simpler flow identification
+pub struct FlowPin {
+    pub key_expr: String,
+}
 
 //  7 6 5 4 3 2 1 0
 // +-+-+-+-+-+-+-+-+
-// ~X|X|X|D|H|L|W|P~
+// ~X|X|F|D|H|L|W|P~
 // +-+-+-+-+-+-+-+-+
 // ~     psid      ~
 // +---------------+
@@ -43,6 +51,8 @@ pub const DWGT: u64 = 1 << 4; // 0x10
 // +---------------+
 // ~ [data_weights]~ if D = 1
 // +---------------+
+// ~ [active_flows]~ if F = 1
+// +---------------+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinkState {
     pub(crate) psid: u64,
@@ -53,6 +63,7 @@ pub(crate) struct LinkState {
     pub(crate) links: Vec<u64>,
     pub(crate) link_weights: Option<Vec<u16>>,
     pub(crate) data_link_weights: Option<Vec<u16>>,
+    pub(crate) active_flows: Option<Vec<FlowPin>>,
 }
 
 #[derive(Default, Copy, Clone, PartialEq, Eq)]
@@ -105,6 +116,7 @@ pub(crate) struct LocalLinkState {
     pub(crate) locators: Option<Vec<Locator>>,
     pub(crate) links: HashMap<ZenohIdProto, LinkEdgeWeight>,
     pub(crate) data_links: HashMap<ZenohIdProto, LinkEdgeWeight>,
+    pub(crate) active_flows: Option<Vec<FlowPin>>,
 }
 
 impl LinkState {
@@ -148,6 +160,7 @@ impl LinkState {
             links,
             link_weights: None,
             data_link_weights: None,
+            active_flows: None,
         }
     }
 }

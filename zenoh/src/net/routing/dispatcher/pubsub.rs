@@ -358,6 +358,15 @@ pub fn route_data(
                             .hat_code
                             .egress_filter(&tables, face, outface, &mut expr)
                         {
+                            // Record flow: key_expr, previous_hop (where data came from), next hop
+                            tables_ref.hat_code.record_flow(
+                                &tables,
+                                expr.full_expr().to_string(),
+                                face.zid,              // previous_hop: data came from face
+                                outface.zid,           // next_hop: sending to outface
+                                msg.ext_qos.get_priority(),
+                            );
+
                             drop(tables);
                             #[cfg(feature = "stats")]
                             if !admin {

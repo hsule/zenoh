@@ -133,6 +133,18 @@ pub(crate) trait HatBaseTrait {
         expr: &mut RoutingExpr,
     ) -> bool;
 
+    fn record_flow(
+        &self,
+        _tables: &Tables,
+        _key_expr: String,
+        _previous_hop: ZenohIdProto,
+        _next_hop: ZenohIdProto,
+        _priority: zenoh_protocol::core::Priority,
+    ) {
+        // Default implementation: do nothing
+        // Override in specific HAT implementations that need flow tracking
+    }
+
     fn info(&self, tables: &Tables, kind: WhatAmI) -> String;
 
     fn close_face(
