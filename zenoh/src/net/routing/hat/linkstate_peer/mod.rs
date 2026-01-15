@@ -219,7 +219,7 @@ impl HatBaseTrait for HatCode {
             .clone();
         drop(config_guard);
 
-        hat_mut!(tables).linkstatepeers_net = Some(Network::new(
+        let net = Network::new(
             PEERS_NET_NAME.to_string(),
             tables.zid,
             runtime,
@@ -231,7 +231,9 @@ impl HatBaseTrait for HatCode {
             autoconnect,
             link_weights_from_config(peer_link_weights, PEERS_NET_NAME)?,
             link_weights_from_config(peer_data_link_weights, PEERS_NET_NAME)?,
-        ));
+        );
+        net.start_cleanup_task();
+        hat_mut!(tables).linkstatepeers_net = Some(net);
         Ok(())
     }
 

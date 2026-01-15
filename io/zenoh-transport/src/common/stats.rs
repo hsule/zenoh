@@ -246,6 +246,7 @@ macro_rules! stats_struct {
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
+
 stats_struct! {
     #[derive(Clone, Debug, Deserialize, Serialize)]
     pub struct DiscriminatedStats {
@@ -255,11 +256,31 @@ stats_struct! {
 }
 
 stats_struct! {
+    /// Per-priority byte counters (8 priority levels)
+    /// Priority 0 = Control (highest), Priority 7 = Background (lowest)
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    pub struct PriorityStats {
+        pub p0_control,
+        pub p1_realtime,
+        pub p2_interactive_high,
+        pub p3_interactive_low,
+        pub p4_data_high,
+        pub p5_data,
+        pub p6_data_low,
+        pub p7_background,
+    }
+}
+
+stats_struct! {
     #[derive(Clone, Debug, Deserialize, Serialize)]
     pub struct TransportStats {
         # HELP "Counter of sent bytes."
         # TYPE "counter"
         pub tx_bytes,
+
+        # HELP "Counter of sent bytes per priority level."
+        # TYPE "counter"
+        pub tx_bytes_priority PriorityStats,
 
         # HELP "Counter of sent transport messages."
         # TYPE "counter"
@@ -308,6 +329,10 @@ stats_struct! {
         # HELP "Counter of received bytes."
         # TYPE "counter"
         pub rx_bytes,
+
+        # HELP "Counter of received bytes per priority level."
+        # TYPE "counter"
+        pub rx_bytes_priority PriorityStats,
 
         # HELP "Counter of received transport messages."
         # TYPE "counter"
@@ -376,5 +401,38 @@ stats_struct! {
         # HELP "Counter of messages dropped by egress low-pass filter."
         # TYPE "counter"
         pub tx_low_pass_dropped_msgs,
+    }
+}
+
+/// Helper methods for per-priority statistics
+impl TransportStats {
+    /// Increment TX bytes counter for a specific priority level
+    pub fn inc_tx_bytes_by_priority(&self, priority: u8, nb: usize) {
+        match priority {
+            0 => self.tx_bytes_priority.inc_p0_control(nb),
+            1 => self.tx_bytes_priority.inc_p1_realtime(nb),
+            2 => self.tx_bytes_priority.inc_p2_interactive_high(nb),
+            3 => self.tx_bytes_priority.inc_p3_interactive_low(nb),
+            4 => self.tx_bytes_priority.inc_p4_data_high(nb),
+            5 => self.tx_bytes_priority.inc_p5_data(nb),
+            6 => self.tx_bytes_priority.inc_p6_data_low(nb),
+            7 => self.tx_bytes_priority.inc_p7_background(nb),
+            _ => {} // Invalid priority, ignore
+        }
+    }
+
+    /// Increment RX bytes counter for a specific priority level
+    pub fn inc_rx_bytes_by_priority(&self, priority: u8, nb: usize) {
+        match priority {
+            0 => self.rx_bytes_priority.inc_p0_control(nb),
+            1 => self.rx_bytes_priority.inc_p1_realtime(nb),
+            2 => self.rx_bytes_priority.inc_p2_interactive_high(nb),
+            3 => self.rx_bytes_priority.inc_p3_interactive_low(nb),
+            4 => self.rx_bytes_priority.inc_p4_data_high(nb),
+            5 => self.rx_bytes_priority.inc_p5_data(nb),
+            6 => self.rx_bytes_priority.inc_p6_data_low(nb),
+            7 => self.rx_bytes_priority.inc_p7_background(nb),
+            _ => {} // Invalid priority, ignore
+        }
     }
 }

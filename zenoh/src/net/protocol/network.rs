@@ -126,14 +126,13 @@ pub(crate) struct Tree {
 pub(crate) type FlowId = String;
 
 /// Information about a flow's current routing
+/// Note: key_expr is stored as the HashMap key (FlowId), not in this struct
 #[derive(Debug, Clone)]
 pub(crate) struct FlowInfo {
-    pub key_expr: String,
     pub previous_hop: ZenohIdProto,  // Where the data came from (upstream neighbor)
     pub next_hop: ZenohIdProto,
     pub priority: zenoh_protocol::core::Priority,
     pub last_update: std::time::Instant,
-    pub packet_count: u64,
 }
 
 /// Flow table for tracking active flows and their routes
@@ -157,15 +156,12 @@ impl FlowTable {
                 info.next_hop = next_hop;
                 info.priority = priority;
                 info.last_update = std::time::Instant::now();
-                info.packet_count += 1;
             })
             .or_insert(FlowInfo {
-                key_expr,
                 previous_hop,
                 next_hop,
                 priority,
                 last_update: std::time::Instant::now(),
-                packet_count: 1,
             });
     }
 
@@ -175,10 +171,6 @@ impl FlowTable {
             .filter(|(_, info)| &info.next_hop == link)
             .map(|(id, _)| id.clone())
             .collect()
-    }
-
-    pub fn remove_flow(&mut self, flow_id: &FlowId) {
-        self.flows.remove(flow_id);
     }
 
     pub fn get_flow(&self, flow_id: &FlowId) -> Option<&FlowInfo> {
@@ -209,8 +201,8 @@ pub(crate) struct Network {
     pub(crate) runtime: Runtime,
     pub(crate) link_weights: HashMap<ZenohIdProto, LinkEdgeWeight>,
     pub(crate) data_link_weights: HashMap<ZenohIdProto, LinkEdgeWeight>,
-    pub(crate) flow_table: std::sync::RwLock<FlowTable>,
-    pub(crate) pinned_flows: std::sync::RwLock<HashMap<FlowId, ZenohIdProto>>,
+    pub(crate) flow_table: std::sync::Arc<std::sync::RwLock<FlowTable>>,
+    pub(crate) pinned_flows: std::sync::Arc<std::sync::RwLock<HashMap<FlowId, ZenohIdProto>>>,
 }
 
 impl Network {
@@ -265,9 +257,73 @@ impl Network {
             runtime,
             link_weights,
             data_link_weights,
-            flow_table: std::sync::RwLock::new(FlowTable::new()),
-            pinned_flows: std::sync::RwLock::new(HashMap::new()),
+            flow_table: std::sync::Arc::new(std::sync::RwLock::new(FlowTable::new())),
+            pinned_flows: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Start the periodic cleanup task for flows and pinned routes
+    /// This should be called after creating the Network
+    pub(crate) fn start_cleanup_task(&self) {
+        let flow_table = self.flow_table.clone();
+        let pinned_flows = self.pinned_flows.clone();
+        let name = self.name.clone();
+
+        self.runtime.spawn(async move {
+            let cleanup_interval = tokio::time::Duration::from_secs(1);
+            let flow_timeout = std::time::Duration::from_secs(5);
+            let mut interval = tokio::time::interval(cleanup_interval);
+
+            loop {
+                interval.tick().await;
+
+                // Cleanup old flows
+                let now = std::time::Instant::now();
+                flow_table.write().unwrap().clear_old_flows(flow_timeout);
+
+                // Cleanup pinned flows that are no longer active
+                let flow_states: HashMap<FlowId, bool> = {
+                    let ft = flow_table.read().unwrap();
+                    pinned_flows.read().unwrap()
+                        .keys()
+                        .map(|flow_id| {
+                            let is_active = ft.get_flow(flow_id)
+                                .map(|info| now.duration_since(info.last_update) < flow_timeout)
+                                .unwrap_or(false);
+                            (flow_id.clone(), is_active)
+                        })
+                        .collect()
+                };
+
+                let mut pinned = pinned_flows.write().unwrap();
+                let before_count = pinned.len();
+
+                pinned.retain(|flow_id, pinned_to| {
+                    let is_active = flow_states.get(flow_id).copied().unwrap_or(false);
+                    if !is_active {
+                        tracing::info!(
+                            "{} Unpin flow (expired by timer): key_expr={}, was_pinned_to={}",
+                            &name,
+                            flow_id,
+                            pinned_to
+                        );
+                    }
+                    is_active
+                });
+
+                let removed_count = before_count - pinned.len();
+                if removed_count > 0 {
+                    tracing::info!(
+                        "{} Periodic cleanup: removed {} stale pinned flows, {} remaining",
+                        &name,
+                        removed_count,
+                        pinned.len()
+                    );
+                }
+            }
+        });
+
+        tracing::info!("{} Started periodic flow cleanup task (interval=10s, TTL=30s)", &self.name);
     }
 
     pub(crate) fn update_link_weights(
@@ -400,21 +456,6 @@ impl Network {
         self.flow_table.write().unwrap().update_flow(key_expr, previous_hop, next_hop, priority);
     }
 
-    /// Get all flows using a specific link
-    pub(crate) fn get_flows_on_link(&self, link: &ZenohIdProto) -> Vec<FlowId> {
-        self.flow_table.read().unwrap().get_flows_using_link(link)
-    }
-
-    /// Clear old inactive flows (older than 30 seconds)
-    pub(crate) fn cleanup_old_flows(&self) {
-        self.flow_table.write().unwrap().clear_old_flows(std::time::Duration::from_secs(30));
-    }
-
-    /// Get flow information (returns cloned FlowInfo to avoid lifetime issues)
-    pub(crate) fn get_flow_info(&self, flow_id: &FlowId) -> Option<FlowInfo> {
-        self.flow_table.read().unwrap().get_flow(flow_id).cloned()
-    }
-
     /// Process flows received from remote nodes to pin their routes and prevent oscillation
     fn process_received_flows(&self, remote_zid: &ZenohIdProto, flows: &[crate::net::protocol::linkstate::FlowPin]) {
         let mut pinned = self.pinned_flows.write().unwrap();
@@ -460,14 +501,6 @@ impl Network {
             )],
             |_link| true,
         );
-    }
-
-    /// Check if a flow is pinned to a specific next hop
-    pub(crate) fn is_flow_pinned(&self, flow_id: &FlowId, next_hop: &ZenohIdProto) -> bool {
-        self.pinned_flows.read().unwrap()
-            .get(flow_id)
-            .map(|pinned_to| pinned_to == next_hop)
-            .unwrap_or(false)
     }
 
     /// Get the pinned next hop for a flow, if it exists
@@ -608,6 +641,30 @@ impl Network {
             if flows.is_empty() {
                 None
             } else {
+                // CRITICAL FIX: Also pin our own downstream route!
+                // When we tell upstream to pin, we must also pin ourselves to downstream
+                // Otherwise our data_tree will have no valid direction after weight=65535
+                {
+                    let mut pinned = self.pinned_flows.write().unwrap();
+                    for (key_expr, info) in flow_table.flows.iter() {
+                        let is_data_priority = matches!(
+                            info.priority,
+                            zenoh_protocol::core::Priority::Data
+                                | zenoh_protocol::core::Priority::DataHigh
+                                | zenoh_protocol::core::Priority::DataLow
+                        );
+                        if is_data_priority && &info.previous_hop == target_zid {
+                            pinned.insert(key_expr.clone(), info.next_hop);
+                            tracing::info!(
+                                "{} Self-pin downstream: key_expr={}, next_hop={}",
+                                &self.name,
+                                key_expr,
+                                info.next_hop
+                            );
+                        }
+                    }
+                }
+
                 tracing::info!(
                     "{} Sending {} flows to UPSTREAM {}",
                     &self.name,

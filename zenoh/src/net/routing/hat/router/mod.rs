@@ -380,7 +380,7 @@ impl HatBaseTrait for HatCode {
         drop(config_guard);
 
         if router_full_linkstate | gossip {
-            hat_mut!(tables).routers_net = Some(Network::new(
+            let net = Network::new(
                 ROUTERS_NET_NAME.to_string(),
                 tables.zid,
                 runtime.clone(),
@@ -392,10 +392,12 @@ impl HatBaseTrait for HatCode {
                 autoconnect,
                 link_weights_from_config(router_link_weights, ROUTERS_NET_NAME)?,
                 link_weights_from_config(router_data_link_weights, ROUTERS_NET_NAME)?,
-            ));
+            );
+            net.start_cleanup_task();
+            hat_mut!(tables).routers_net = Some(net);
         }
         if peer_full_linkstate | gossip {
-            hat_mut!(tables).linkstatepeers_net = Some(Network::new(
+            let net = Network::new(
                 PEERS_NET_NAME.to_string(),
                 tables.zid,
                 runtime,
@@ -407,7 +409,9 @@ impl HatBaseTrait for HatCode {
                 autoconnect,
                 link_weights_from_config(peer_link_weights, PEERS_NET_NAME)?,
                 link_weights_from_config(peer_data_link_weights, PEERS_NET_NAME)?,
-            ));
+            );
+            net.start_cleanup_task();
+            hat_mut!(tables).linkstatepeers_net = Some(net);
         }
         if router_full_linkstate && peer_full_linkstate {
             hat_mut!(tables).shared_nodes = shared_nodes(

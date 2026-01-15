@@ -88,19 +88,24 @@ async fn main() {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let now_ns = (now.as_secs() as u128) * 1_000_000_000 + now.subsec_nanos() as u128;
 
-        // DATA priority publisher
-        let prefix_data = format!("[{:4}] ts_ns={} ", idx, now_ns);
-        let payload_len_data = bytes_per_interval.saturating_sub(prefix_data.len());
-        let payload_data: String = std::iter::repeat('A').take(payload_len_data).collect();
-        let buf_data = prefix_data + &payload_data;
+        // DATA priority publisher (pub1)
+        // pub1 runs for first 30 seconds, then stops to test RECOVER
+        if elapsed < Duration::from_secs(30) {
+            let prefix_data = format!("[{:4}] ts_ns={} ", idx, now_ns);
+            let payload_len_data = bytes_per_interval.saturating_sub(prefix_data.len());
+            let payload_data: String = std::iter::repeat('A').take(payload_len_data).collect();
+            let buf_data = prefix_data + &payload_data;
 
-        println!("Putting DATA ('{}': '{}')...", &key_expr, buf_data);
-        publisher
-            .put(buf_data)
-            .encoding(Encoding::TEXT_PLAIN)
-            .attachment(attachment.clone())
-            .await
-            .unwrap();
+            println!("Putting DATA ('{}': '{}')...", &key_expr, buf_data);
+            publisher
+                .put(buf_data)
+                .encoding(Encoding::TEXT_PLAIN)
+                .attachment(attachment.clone())
+                .await
+                .unwrap();
+        } else if elapsed >= Duration::from_secs(30) && elapsed < Duration::from_secs(31) {
+            println!("=== pub1 STOPPED at 30s to test RECOVER ===");
+        }
 
         // REALTIME priority publisher
         let prefix_rt = format!("[{:4}] ts_ns={} ", idx, now_ns);
@@ -116,8 +121,8 @@ async fn main() {
             .await
             .unwrap();
 
-        // After 60 seconds, also publish to demo/example/zenoh-rs-pub2
-        if elapsed >= Duration::from_secs(60) {
+        // After 30 seconds, also publish to demo/example/zenoh-rs-pub2
+        if elapsed >= Duration::from_secs(30) {
             let prefix_pub2 = format!("[{:4}] ts_ns={} ", idx, now_ns);
             let payload_len_pub2 = bytes_per_interval.saturating_sub(prefix_pub2.len());
             let payload_pub2: String = std::iter::repeat('B').take(payload_len_pub2).collect();

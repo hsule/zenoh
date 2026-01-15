@@ -448,6 +448,7 @@ async fn tx_task(
                         {
                             stats.inc_tx_t_msgs(batch.stats.t_msgs);
                             stats.inc_tx_bytes(batch.len() as usize);
+                            stats.inc_tx_bytes_by_priority(priority as u8, batch.len() as usize);
                         }
                         // Reinsert the batch into the queue
                         pipeline.refill(batch, priority);
@@ -455,7 +456,7 @@ async fn tx_task(
                     None => {
                         // Drain the transmission pipeline and write remaining bytes on the wire
                         let mut batches = pipeline.drain();
-                        for (mut b, _) in batches.drain(..) {
+                        for (mut b, priority) in batches.drain(..) {
                             tokio::time::timeout(config.join_interval, link.send_batch(&mut b))
                                 .await
                                 .map_err(|_| {
@@ -470,6 +471,7 @@ async fn tx_task(
                             {
                                 stats.inc_tx_t_msgs(b.stats.t_msgs);
                                 stats.inc_tx_bytes(b.len() as usize);
+                                stats.inc_tx_bytes_by_priority(priority as u8, b.len() as usize);
                             }
                         }
                         break;

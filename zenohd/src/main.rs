@@ -33,7 +33,7 @@ lazy_static::lazy_static!(
     static ref LONG_VERSION: String = format!("{} built with {}", GIT_VERSION, env!("RUSTC_VERSION"));
 );
 
-const METRICS_INTERVAL_SECS: u64 = 1;
+const METRICS_INTERVAL_SECS: u64 = 5;
 const BLOCK_WEIGHT: u64 = 65535;
 type PeerCapacityMap = HashMap<String, u64>;
 
@@ -90,6 +90,31 @@ struct Args {
     adminspace_permissions: Option<String>,
 }
 
+/// Per-priority byte counters
+#[derive(Default, Clone)]
+struct PriorityCounters {
+    p0_control: u64,
+    p1_realtime: u64,
+    p2_interactive_high: u64,
+    p3_interactive_low: u64,
+    p4_data_high: u64,
+    p5_data: u64,
+    p6_data_low: u64,
+    p7_background: u64,
+}
+
+impl PriorityCounters {
+    /// Sum of high-priority traffic (Control + RealTime)
+    fn high_priority_total(&self) -> u64 {
+        self.p0_control + self.p1_realtime
+    }
+
+    /// Sum of data traffic (DataHigh + Data + DataLow + Background)
+    fn data_total(&self) -> u64 {
+        self.p4_data_high + self.p5_data + self.p6_data_low + self.p7_background
+    }
+}
+
 struct Counters {
     tx_bytes: u64,
     rx_bytes: u64,
@@ -97,6 +122,8 @@ struct Counters {
     rx_msgs: u64,
     tx_dropped: u64,
     rx_dropped: u64,
+    tx_priority: PriorityCounters,
+    rx_priority: PriorityCounters,
 }
 
 fn parse_prometheus(metrics: &str) -> HashMap<String, Counters> {
@@ -123,6 +150,8 @@ fn parse_prometheus(metrics: &str) -> HashMap<String, Counters> {
                             rx_msgs: 0,
                             tx_dropped: 0,
                             rx_dropped: 0,
+                            tx_priority: PriorityCounters::default(),
+                            rx_priority: PriorityCounters::default(),
                         });
 
                         if key.starts_with("tx_bytes{") {
@@ -137,6 +166,46 @@ fn parse_prometheus(metrics: &str) -> HashMap<String, Counters> {
                             entry.tx_dropped = v;
                         } else if key.starts_with("rx_n_dropped{") {
                             entry.rx_dropped = v;
+                        }
+                        // Parse per-priority TX bytes
+                        else if key.starts_with("tx_bytes_priority{") {
+                            if key.contains("space=\"p0_control\"") {
+                                entry.tx_priority.p0_control = v;
+                            } else if key.contains("space=\"p1_realtime\"") {
+                                entry.tx_priority.p1_realtime = v;
+                            } else if key.contains("space=\"p2_interactive_high\"") {
+                                entry.tx_priority.p2_interactive_high = v;
+                            } else if key.contains("space=\"p3_interactive_low\"") {
+                                entry.tx_priority.p3_interactive_low = v;
+                            } else if key.contains("space=\"p4_data_high\"") {
+                                entry.tx_priority.p4_data_high = v;
+                            } else if key.contains("space=\"p5_data\"") {
+                                entry.tx_priority.p5_data = v;
+                            } else if key.contains("space=\"p6_data_low\"") {
+                                entry.tx_priority.p6_data_low = v;
+                            } else if key.contains("space=\"p7_background\"") {
+                                entry.tx_priority.p7_background = v;
+                            }
+                        }
+                        // Parse per-priority RX bytes
+                        else if key.starts_with("rx_bytes_priority{") {
+                            if key.contains("space=\"p0_control\"") {
+                                entry.rx_priority.p0_control = v;
+                            } else if key.contains("space=\"p1_realtime\"") {
+                                entry.rx_priority.p1_realtime = v;
+                            } else if key.contains("space=\"p2_interactive_high\"") {
+                                entry.rx_priority.p2_interactive_high = v;
+                            } else if key.contains("space=\"p3_interactive_low\"") {
+                                entry.rx_priority.p3_interactive_low = v;
+                            } else if key.contains("space=\"p4_data_high\"") {
+                                entry.rx_priority.p4_data_high = v;
+                            } else if key.contains("space=\"p5_data\"") {
+                                entry.rx_priority.p5_data = v;
+                            } else if key.contains("space=\"p6_data_low\"") {
+                                entry.rx_priority.p6_data_low = v;
+                            } else if key.contains("space=\"p7_background\"") {
+                                entry.rx_priority.p7_background = v;
+                            }
                         }
                     }
                 }
@@ -205,6 +274,21 @@ async fn main() {
                                         let throughput_tx = dtx as f64 * 8.0 / dt / 1_000_000.0;
                                         let throughput_rx = drx as f64 * 8.0 / dt / 1_000_000.0;
 
+                                        // Calculate per-priority throughput
+                                        let dtx_high_priority = cur.tx_priority.high_priority_total()
+                                            .saturating_sub(prev_c.tx_priority.high_priority_total());
+                                        let drx_high_priority = cur.rx_priority.high_priority_total()
+                                            .saturating_sub(prev_c.rx_priority.high_priority_total());
+                                        let dtx_data = cur.tx_priority.data_total()
+                                            .saturating_sub(prev_c.tx_priority.data_total());
+                                        let drx_data = cur.rx_priority.data_total()
+                                            .saturating_sub(prev_c.rx_priority.data_total());
+
+                                        let throughput_tx_high_priority = dtx_high_priority as f64 * 8.0 / dt / 1_000_000.0;
+                                        let throughput_rx_high_priority = drx_high_priority as f64 * 8.0 / dt / 1_000_000.0;
+                                        let throughput_tx_data = dtx_data as f64 * 8.0 / dt / 1_000_000.0;
+                                        let throughput_rx_data = drx_data as f64 * 8.0 / dt / 1_000_000.0;
+
                                         let dtx_msgs = cur.tx_msgs.saturating_sub(prev_c.tx_msgs);
                                         let d_drop = cur.tx_dropped.saturating_sub(prev_c.tx_dropped);
 
@@ -216,21 +300,42 @@ async fn main() {
                                         };
 
                                         let capacity = match peer_cap_map.get(zid) {
-                                        Some(cap) => *cap,
-                                        None => {
-                                            tracing::warn!("Unconfigured ZID {} found in metrics. Assuming DEFAULT_CAPACITY of 100 Mbps.", zid);
-                                            100
-                                        }
-                                    };
-                                        let cap_limit = capacity as f64 - 2.0;
+                                            Some(cap) => *cap,
+                                            None => {
+                                                tracing::warn!("Unconfigured ZID {} found in metrics. Assuming DEFAULT_CAPACITY of 100 Mbps.", zid);
+                                                100
+                                            }
+                                        };
+
+                                        // Dynamic cap_limit: reserve bandwidth for high-priority traffic
+                                        // cap_limit for Data = capacity - high_priority_throughput - buffer
+                                        let high_priority_throughput = throughput_tx_high_priority.max(throughput_rx_high_priority);
+                                        let buffer = 2.0; // 2 Mbps buffer
+                                        let cap_limit = (capacity as f64 - high_priority_throughput - buffer).max(0.0);
+
                                         let current_monitored_weight = *current_weights.get(zid).unwrap_or(&100);
                                         let mut target_weight = current_monitored_weight;
-                                        println!("cap_limit {}",cap_limit);
 
-                                        
-                                        if throughput_tx > cap_limit || throughput_rx > cap_limit {
+                                        println!(
+                                            "[QoS zid={}] HighPri: TX={:.2} RX={:.2} Mbps | Data: TX={:.2} RX={:.2} Mbps | cap_limit={:.2}",
+                                            zid, throughput_tx_high_priority, throughput_rx_high_priority,
+                                            throughput_tx_data, throughput_rx_data, cap_limit
+                                        );
+
+                                        // Path blocking: Data traffic exceeds dynamic cap_limit
+                                        let data_throughput = throughput_tx_data.max(throughput_rx_data);
+                                        if data_throughput > cap_limit {
                                             target_weight = BLOCK_WEIGHT;
-                                            println!("[DEBUG zid={}] BLOCKKK", zid);
+                                            println!("[DEBUG zid={}] BLOCK (data throughput {:.2} exceeds cap_limit {:.2})", zid, data_throughput, cap_limit);
+                                        }
+                                        // Path recovery: low traffic -> restore weight
+                                        else if current_monitored_weight == BLOCK_WEIGHT {
+                                            // Recovery threshold: restore when data throughput drops below 50% of dynamic cap_limit
+                                            let recovery_threshold = cap_limit * 0.2;
+                                            if data_throughput < recovery_threshold {
+                                                target_weight = 100; // Default weight
+                                                println!("[DEBUG zid={}] RECOVER (data throughput {:.2} below recovery threshold {:.2})", zid, data_throughput, recovery_threshold);
+                                            }
                                         }
                                         if current_monitored_weight != target_weight {
                                             current_weights.insert(zid.clone(), target_weight);
